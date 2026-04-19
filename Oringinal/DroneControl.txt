@@ -1,0 +1,631 @@
+/*
+ * ESP32 Mini Display Drone Autopilot
+ * 
+ * Hardware:
+ * - ESP32 Mini with Display (128x64 OLED)
+ * - MPU6050 Gyro/Accelerometer (I2C)
+ * - BLE 5.1 for AoA positioning
+ * - SBUS output to Betaflight FC
+ * 
+ * Features:
+ * - Receives mission keyframes via WiFi
+ * - Gets real position from BLE AoA (10 anchors)
+ * - 3-axis gyro stabilization
+ * - Autonomous navigation with PID
+ * - SBUS output (100kbaud, inverted)
+ * - Display shows status
+ */
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <MPU6050.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <HardwareSerial.h>
+
+// Display Configuration
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// MPU6050 Gyro
+MPU6050 mpu;
+
+// SBUS Configuration
+#define SBUS_PIN 17  // TX pin for SBUS
+HardwareSerial SBUSSerial(2);
+
+// WiFi Configuration
+const char* ssid = "DroneControl";
+const char* password = "drone123";
+WiFiUDP udp;
+const int UDP_PORT = 8888;
+
+// Mission Data
+struct Keyframe {
+  float time;
+  float x, y, z;
+  float yaw, pitch, roll;
+};
+
+#define MAX_KEYFRAMES 100
+Keyframe mission[MAX_KEYFRAMES];
+int numKeyframes = 0;
+unsigned long missionStartTime = 0;
+bool missionActive = false;
+
+// Current State
+struct DroneState {
+  // Position (from BLE AoA)
+  float x, y, z;
+  
+  // Orientation (from MPU6050)
+  float roll, pitch, yaw;
+  
+  // Velocity (calculated)
+  float vx, vy, vz;
+  
+  // Target
+  float targetX, targetY, targetZ;
+  float targetYaw, targetPitch, targetRoll;
+  
+  // Error
+  float errorX, errorY, errorZ, errorYaw;
+  
+  // Battery
+  float battery;
+} state;
+
+// PID Controllers
+struct PIDController {
+  float kp, ki, kd;
+  float integral;
+  float lastError;
+  float maxIntegral;
+  
+  PIDController(float p, float i, float d, float maxI = 100.0) 
+    : kp(p), ki(i), kd(d), integral(0), lastError(0), maxIntegral(maxI) {}
+  
+  float calculate(float error, float dt) {
+    integral += error * dt;
+    
+    // Anti-windup
+    if (integral > maxIntegral) integral = maxIntegral;
+    if (integral < -maxIntegral) integral = -maxIntegral;
+    
+    float derivative = (error - lastError) / dt;
+    lastError = error;
+    
+    return kp * error + ki * integral + kd * derivative;
+  }
+  
+  void reset() {
+    integral = 0;
+    lastError = 0;
+  }
+};
+
+// PID instances for position control
+PIDController pidX(1.5, 0.2, 0.8, 50.0);
+PIDController pidY(1.5, 0.2, 0.8, 50.0);
+PIDController pidZ(2.0, 0.3, 1.0, 50.0);
+PIDController pidYaw(3.0, 0.1, 1.5, 30.0);
+
+// SBUS packet structure (25 bytes)
+uint8_t sbusPacket[25];
+
+// BLE Position simulation (replace with actual BLE library)
+struct BLEPosition {
+  float x, y, z;
+  float accuracy;
+  unsigned long timestamp;
+};
+BLEPosition blePosition = {0, 0, 0, 0.2, 0};
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("ESP32 Drone Autopilot Starting...");
+  
+  // Initialize Display
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for(;;);
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);
+  display.println("Drone Autopilot");
+  display.println("Initializing...");
+  display.display();
+  delay(1000);
+  
+  // Initialize MPU6050
+  Wire.begin();
+  mpu.initialize();
+  if (!mpu.testConnection()) {
+    Serial.println("MPU6050 connection failed!");
+    displayError("MPU6050 FAIL");
+    while(1);
+  }
+  Serial.println("MPU6050 connected");
+  
+  // Calibrate gyro
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.println("Calibrating Gyro");
+  display.println("Keep level!");
+  display.display();
+  calibrateGyro();
+  
+  // Initialize SBUS
+  SBUSSerial.begin(100000, SERIAL_8E2, -1, SBUS_PIN, true); // Inverted
+  initSBUS();
+  Serial.println("SBUS initialized");
+  
+  // Connect WiFi
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.println("Connecting WiFi");
+  display.display();
+  
+  WiFi.begin(ssid, password);
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+    udp.begin(UDP_PORT);
+  } else {
+    Serial.println("\nWiFi failed - continuing without");
+  }
+  
+  // Initialize BLE (placeholder - add actual BLE library)
+  initBLE();
+  
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.println("READY");
+  display.print("IP: ");
+  display.println(WiFi.localIP());
+  display.display();
+  delay(2000);
+  
+  Serial.println("System ready!");
+}
+
+void loop() {
+  static unsigned long lastUpdate = 0;
+  static unsigned long lastDisplay = 0;
+  unsigned long now = millis();
+  float dt = (now - lastUpdate) / 1000.0;
+  
+  if (dt < 0.01) return; // 100Hz max
+  lastUpdate = now;
+  
+  // 1. Read Gyro/Accelerometer
+  readMPU6050();
+  
+  // 2. Get BLE Position
+  updateBLEPosition();
+  
+  // 3. Check for WiFi commands
+  checkWiFiCommands();
+  
+  // 4. Update mission state
+  if (missionActive) {
+    updateMission();
+  }
+  
+  // 5. Calculate control outputs
+  calculateControl(dt);
+  
+  // 6. Generate SBUS packet
+  generateSBUS();
+  
+  // 7. Send SBUS to Betaflight
+  sendSBUS();
+  
+  // 8. Update display (10Hz)
+  if (now - lastDisplay > 100) {
+    updateDisplay();
+    lastDisplay = now;
+  }
+  
+  // 9. Send telemetry
+  sendTelemetry();
+}
+
+void calibrateGyro() {
+  const int samples = 1000;
+  int32_t gyroOffsets[3] = {0, 0, 0};
+  
+  for (int i = 0; i < samples; i++) {
+    int16_t gx, gy, gz;
+    mpu.getRotation(&gx, &gy, &gz);
+    gyroOffsets[0] += gx;
+    gyroOffsets[1] += gy;
+    gyroOffsets[2] += gz;
+    delay(3);
+  }
+  
+  mpu.setXGyroOffset(gyroOffsets[0] / samples);
+  mpu.setYGyroOffset(gyroOffsets[1] / samples);
+  mpu.setZGyroOffset(gyroOffsets[2] / samples);
+  
+  Serial.println("Gyro calibrated");
+}
+
+void readMPU6050() {
+  int16_t ax, ay, az;
+  int16_t gx, gy, gz;
+  
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+  
+  // Convert to degrees/second
+  float gyroX = gx / 131.0;
+  float gyroY = gy / 131.0;
+  float gyroZ = gz / 131.0;
+  
+  // Convert to g's
+  float accelX = ax / 16384.0;
+  float accelY = ay / 16384.0;
+  float accelZ = az / 16384.0;
+  
+  // Complementary filter for roll and pitch
+  static float roll = 0, pitch = 0, yaw = 0;
+  static unsigned long lastTime = millis();
+  
+  unsigned long now = millis();
+  float dt = (now - lastTime) / 1000.0;
+  lastTime = now;
+  
+  // Accelerometer angles
+  float accelRoll = atan2(accelY, accelZ) * 180.0 / PI;
+  float accelPitch = atan2(-accelX, sqrt(accelY*accelY + accelZ*accelZ)) * 180.0 / PI;
+  
+  // Integrate gyro
+  roll += gyroX * dt;
+  pitch += gyroY * dt;
+  yaw += gyroZ * dt;
+  
+  // Complementary filter (98% gyro, 2% accel)
+  roll = 0.98 * roll + 0.02 * accelRoll;
+  pitch = 0.98 * pitch + 0.02 * accelPitch;
+  
+  state.roll = roll;
+  state.pitch = pitch;
+  state.yaw = yaw;
+}
+
+void updateBLEPosition() {
+  // Placeholder - replace with actual BLE AoA positioning
+  // This would interface with your 10-anchor BLE system
+  
+  // For now, simulate receiving position
+  // In reality, you'd parse BLE packets here
+  
+  state.x = blePosition.x;
+  state.y = blePosition.y;
+  state.z = blePosition.z;
+  
+  // TODO: Implement actual BLE 5.1 AoA position reading
+  // This would use Nordic nRF52 or similar BLE 5.1 chip
+  // communicating with ESP32 via UART or I2C
+}
+
+void initBLE() {
+  // TODO: Initialize BLE 5.1 positioning
+  // This requires additional hardware (nRF52840 or similar)
+  // communicating with the 10 anchor system
+  Serial.println("BLE positioning initialized (placeholder)");
+}
+
+void checkWiFiCommands() {
+  int packetSize = udp.parsePacket();
+  if (packetSize) {
+    char packet[1024];
+    int len = udp.read(packet, sizeof(packet) - 1);
+    packet[len] = 0;
+    
+    // Parse JSON command
+    // Format: {"cmd":"mission","data":[{"t":0,"x":0,"y":0,"z":2,"yaw":0,"pitch":0,"roll":0}, ...]}
+    
+    if (strstr(packet, "mission")) {
+      parseMissionData(packet);
+    } else if (strstr(packet, "start")) {
+      startMission();
+    } else if (strstr(packet, "stop")) {
+      stopMission();
+    } else if (strstr(packet, "emergency")) {
+      emergencyStop();
+    }
+  }
+}
+
+void parseMissionData(const char* json) {
+  // Simple JSON parser for mission data
+  // In production, use ArduinoJson library
+  
+  // For now, placeholder
+  Serial.println("Mission data received");
+  numKeyframes = 3; // Example
+  
+  // Example mission
+  mission[0] = {0.0, 0, 0, 0, 0, 0, 0};
+  mission[1] = {5.0, 3, 3, 3, 0, 0, 0};
+  mission[2] = {10.0, 0, 0, 2, 0, 0, 0};
+  
+  displayMessage("Mission loaded", String(numKeyframes) + " keyframes");
+}
+
+void startMission() {
+  missionActive = true;
+  missionStartTime = millis();
+  
+  // Reset PIDs
+  pidX.reset();
+  pidY.reset();
+  pidZ.reset();
+  pidYaw.reset();
+  
+  Serial.println("Mission started!");
+  displayMessage("Mission", "STARTED");
+}
+
+void stopMission() {
+  missionActive = false;
+  Serial.println("Mission stopped");
+  displayMessage("Mission", "STOPPED");
+}
+
+void emergencyStop() {
+  missionActive = false;
+  
+  // Send zero throttle SBUS
+  for (int i = 0; i < 10; i++) {
+    generateSBUS(true); // Emergency mode
+    sendSBUS();
+    delay(10);
+  }
+  
+  Serial.println("EMERGENCY STOP!");
+  displayMessage("EMERGENCY", "STOP!");
+}
+
+void updateMission() {
+  if (numKeyframes == 0) return;
+  
+  float missionTime = (millis() - missionStartTime) / 1000.0;
+  
+  // Find surrounding keyframes
+  int idx = 0;
+  for (int i = 0; i < numKeyframes - 1; i++) {
+    if (mission[i].time <= missionTime && mission[i+1].time >= missionTime) {
+      idx = i;
+      break;
+    }
+  }
+  
+  // Check if mission complete
+  if (missionTime > mission[numKeyframes - 1].time) {
+    stopMission();
+    return;
+  }
+  
+  // Interpolate between keyframes
+  float t1 = mission[idx].time;
+  float t2 = mission[idx+1].time;
+  float alpha = (missionTime - t1) / (t2 - t1);
+  
+  // Smooth interpolation (ease in/out)
+  alpha = alpha * alpha * (3.0 - 2.0 * alpha);
+  
+  state.targetX = mission[idx].x + (mission[idx+1].x - mission[idx].x) * alpha;
+  state.targetY = mission[idx].y + (mission[idx+1].y - mission[idx].y) * alpha;
+  state.targetZ = mission[idx].z + (mission[idx+1].z - mission[idx].z) * alpha;
+  state.targetYaw = mission[idx].yaw + (mission[idx+1].yaw - mission[idx].yaw) * alpha;
+  state.targetPitch = mission[idx].pitch + (mission[idx+1].pitch - mission[idx].pitch) * alpha;
+  state.targetRoll = mission[idx].roll + (mission[idx+1].roll - mission[idx].roll) * alpha;
+}
+
+void calculateControl(float dt) {
+  // Calculate position errors
+  state.errorX = state.targetX - state.x;
+  state.errorY = state.targetY - state.y;
+  state.errorZ = state.targetZ - state.z;
+  state.errorYaw = state.targetYaw - state.yaw;
+  
+  // PID calculations
+  float controlX = pidX.calculate(state.errorX, dt);
+  float controlY = pidY.calculate(state.errorY, dt);
+  float controlZ = pidZ.calculate(state.errorZ, dt);
+  float controlYaw = pidYaw.calculate(state.errorYaw, dt);
+  
+  // Convert to SBUS channels (constraints applied in generateSBUS)
+  // These will be converted to SBUS values (172-1811)
+  state.vx = constrain(controlX, -1.0, 1.0);
+  state.vy = constrain(controlY, -1.0, 1.0);
+  state.vz = constrain(controlZ, -1.0, 1.0);
+}
+
+void initSBUS() {
+  // Initialize SBUS packet
+  sbusPacket[0] = 0x0F; // Header
+  
+  // Initialize all channels to center (1023)
+  uint16_t channels[16];
+  for (int i = 0; i < 16; i++) {
+    channels[i] = 1023; // Center position
+  }
+  
+  packSBUSChannels(channels);
+  
+  sbusPacket[23] = 0x00; // Flags
+  sbusPacket[24] = 0x00; // Footer
+}
+
+void generateSBUS(bool emergency = false) {
+  uint16_t channels[16];
+  
+  if (emergency) {
+    // Emergency: throttle to minimum, all else centered
+    channels[0] = 172;   // Roll - min
+    channels[1] = 172;   // Pitch - min
+    channels[2] = 172;   // Throttle - min
+    channels[3] = 1023;  // Yaw - center
+    for (int i = 4; i < 16; i++) channels[i] = 1023;
+  } else {
+    // Map control outputs to SBUS range (172-1811, center: 1023)
+    // Betaflight channels: Roll, Pitch, Throttle, Yaw
+    
+    channels[0] = map(state.vy * 1000, -1000, 1000, 172, 1811);      // Roll (Y control)
+    channels[1] = map(state.vx * 1000, -1000, 1000, 172, 1811);      // Pitch (X control)
+    channels[2] = map(state.vz * 1000, -1000, 1000, 172, 1811);      // Throttle (Z control)
+    channels[3] = map(state.errorYaw * 10, -180, 180, 172, 1811);    // Yaw
+    
+    // AUX channels
+    channels[4] = missionActive ? 1811 : 172;  // ARM switch
+    channels[5] = 1023;  // Flight mode
+    
+    for (int i = 6; i < 16; i++) {
+      channels[i] = 1023; // Center
+    }
+  }
+  
+  packSBUSChannels(channels);
+  
+  sbusPacket[23] = 0x00; // Flags (no failsafe, no frame lost)
+  sbusPacket[24] = 0x00; // Footer
+}
+
+void packSBUSChannels(uint16_t* channels) {
+  // Pack 16 11-bit channels into SBUS packet
+  sbusPacket[1] = (uint8_t)((channels[0] & 0x07FF));
+  sbusPacket[2] = (uint8_t)((channels[0] & 0x07FF) >> 8 | (channels[1] & 0x07FF) << 3);
+  sbusPacket[3] = (uint8_t)((channels[1] & 0x07FF) >> 5 | (channels[2] & 0x07FF) << 6);
+  sbusPacket[4] = (uint8_t)((channels[2] & 0x07FF) >> 2);
+  sbusPacket[5] = (uint8_t)((channels[2] & 0x07FF) >> 10 | (channels[3] & 0x07FF) << 1);
+  sbusPacket[6] = (uint8_t)((channels[3] & 0x07FF) >> 7 | (channels[4] & 0x07FF) << 4);
+  sbusPacket[7] = (uint8_t)((channels[4] & 0x07FF) >> 4 | (channels[5] & 0x07FF) << 7);
+  sbusPacket[8] = (uint8_t)((channels[5] & 0x07FF) >> 1);
+  sbusPacket[9] = (uint8_t)((channels[5] & 0x07FF) >> 9 | (channels[6] & 0x07FF) << 2);
+  sbusPacket[10] = (uint8_t)((channels[6] & 0x07FF) >> 6 | (channels[7] & 0x07FF) << 5);
+  sbusPacket[11] = (uint8_t)((channels[7] & 0x07FF) >> 3);
+  sbusPacket[12] = (uint8_t)((channels[8] & 0x07FF));
+  sbusPacket[13] = (uint8_t)((channels[8] & 0x07FF) >> 8 | (channels[9] & 0x07FF) << 3);
+  sbusPacket[14] = (uint8_t)((channels[9] & 0x07FF) >> 5 | (channels[10] & 0x07FF) << 6);
+  sbusPacket[15] = (uint8_t)((channels[10] & 0x07FF) >> 2);
+  sbusPacket[16] = (uint8_t)((channels[10] & 0x07FF) >> 10 | (channels[11] & 0x07FF) << 1);
+  sbusPacket[17] = (uint8_t)((channels[11] & 0x07FF) >> 7 | (channels[12] & 0x07FF) << 4);
+  sbusPacket[18] = (uint8_t)((channels[12] & 0x07FF) >> 4 | (channels[13] & 0x07FF) << 7);
+  sbusPacket[19] = (uint8_t)((channels[13] & 0x07FF) >> 1);
+  sbusPacket[20] = (uint8_t)((channels[13] & 0x07FF) >> 9 | (channels[14] & 0x07FF) << 2);
+  sbusPacket[21] = (uint8_t)((channels[14] & 0x07FF) >> 6 | (channels[15] & 0x07FF) << 5);
+  sbusPacket[22] = (uint8_t)((channels[15] & 0x07FF) >> 3);
+}
+
+void sendSBUS() {
+  SBUSSerial.write(sbusPacket, 25);
+}
+
+void sendTelemetry() {
+  static unsigned long lastTelemetry = 0;
+  if (millis() - lastTelemetry < 100) return; // 10Hz
+  lastTelemetry = millis();
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    char telemetry[256];
+    snprintf(telemetry, sizeof(telemetry),
+      "{\"x\":%.2f,\"y\":%.2f,\"z\":%.2f,\"yaw\":%.1f,\"pitch\":%.1f,\"roll\":%.1f,\"tx\":%.2f,\"ty\":%.2f,\"tz\":%.2f}",
+      state.x, state.y, state.z,
+      state.yaw, state.pitch, state.roll,
+      state.targetX, state.targetY, state.targetZ
+    );
+    
+    udp.beginPacket(udp.remoteIP(), udp.remotePort());
+    udp.write((uint8_t*)telemetry, strlen(telemetry));
+    udp.endPacket();
+  }
+}
+
+void updateDisplay() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+  
+  // Line 1: Status
+  display.print(missionActive ? "MISSION: " : "IDLE: ");
+  display.println(WiFi.status() == WL_CONNECTED ? "WiFi OK" : "No WiFi");
+  
+  // Line 2: Position
+  display.print("Pos: ");
+  display.print(state.x, 1);
+  display.print(",");
+  display.print(state.y, 1);
+  display.print(",");
+  display.println(state.z, 1);
+  
+  // Line 3: Target
+  if (missionActive) {
+    display.print("Tgt: ");
+    display.print(state.targetX, 1);
+    display.print(",");
+    display.print(state.targetY, 1);
+    display.print(",");
+    display.println(state.targetZ, 1);
+  } else {
+    display.print("Gyro: ");
+    display.print(state.roll, 0);
+    display.print(",");
+    display.print(state.pitch, 0);
+    display.print(",");
+    display.println(state.yaw, 0);
+  }
+  
+  // Line 4: Error
+  if (missionActive) {
+    display.print("Err: ");
+    display.print(state.errorX, 1);
+    display.print(",");
+    display.print(state.errorY, 1);
+    display.print(",");
+    display.println(state.errorZ, 1);
+  }
+  
+  // Line 5-6: Keyframes
+  display.print("KF: ");
+  display.print(numKeyframes);
+  
+  display.display();
+}
+
+void displayMessage(const char* line1, String line2 = "") {
+  display.clearDisplay();
+  display.setCursor(0, 20);
+  display.setTextSize(2);
+  display.println(line1);
+  if (line2.length() > 0) {
+    display.setTextSize(1);
+    display.println(line2);
+  }
+  display.display();
+}
+
+void displayError(const char* error) {
+  display.clearDisplay();
+  display.setCursor(0, 20);
+  display.setTextSize(2);
+  display.println("ERROR:");
+  display.setTextSize(1);
+  display.println(error);
+  display.display();
+}

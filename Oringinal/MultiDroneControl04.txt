@@ -1,0 +1,836 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { Wifi, WifiOff, Play, Square, Upload, Download, Plus, Trash2, AlertCircle, Radio, Settings, Target } from 'lucide-react';
+import * as THREE from 'three';
+
+const MultiDroneControl = () => {
+  const [drones, setDrones] = useState([]);
+  const [anchors, setAnchors] = useState([]);
+  const [keyframes, setKeyframes] = useState([]);
+  const [selectedKeyframe, setSelectedKeyframe] = useState(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [playbackTime, setPlaybackTime] = useState(0);
+  const [log, setLog] = useState([]);
+  const [interpolationMode, setInterpolationMode] = useState('smooth');
+  const [showAnchorSetup, setShowAnchorSetup] = useState(false);
+  const [bleConnected, setBleConnected] = useState(false);
+  
+  const canvasRef = useRef(null);
+  const sceneRef = useRef(null);
+  const cameraRef = useRef(null);
+  const rendererRef = useRef(null);
+  const droneModelsRef = useRef([]);
+  const anchorModelsRef = useRef([]);
+  const pathLinesRef = useRef([]);
+  const animationFrameRef = useRef(null);
+  const playbackIntervalRef = useRef(null);
+
+  // Initialisiere 10-Anker System
+  useEffect(() => {
+    const anchorSetup = [
+      { id: 1, name: 'A1', x: -12.5, y: -12.5, z: 3, active: true },
+      { id: 2, name: 'A2', x: 12.5, y: -12.5, z: 3, active: true },
+      { id: 3, name: 'A3', x: -12.5, y: 12.5, z: 3, active: true },
+      { id: 4, name: 'A4', x: 12.5, y: 12.5, z: 3, active: true },
+      { id: 5, name: 'A5', x: 0, y: -12.5, z: 3, active: true },
+      { id: 6, name: 'A6', x: 0, y: 12.5, z: 3, active: true },
+      { id: 7, name: 'A7', x: -12.5, y: 0, z: 3, active: true },
+      { id: 8, name: 'A8', x: 12.5, y: 0, z: 3, active: true },
+      { id: 9, name: 'A9', x: -6, y: 0, z: 3, active: true },
+      { id: 10, name: 'A10', x: 6, y: 0, z: 3, active: true },
+    ];
+    setAnchors(anchorSetup);
+
+    const initialDrones = [
+      { id: 1, name: 'Drohne-01', ip: '192.168.1.101', bleAddress: 'D0:01', connected: false, battery: 100, color: 0xff0000, x: 0, y: 0, z: 0, yaw: 0, pitch: 0, roll: 0, targetReached: false },
+      { id: 2, name: 'Drohne-02', ip: '192.168.1.102', bleAddress: 'D0:02', connected: false, battery: 95, color: 0x00ff00, x: 0, y: 0, z: 0, yaw: 0, pitch: 0, roll: 0, targetReached: false },
+      { id: 3, name: 'Drohne-03', ip: '192.168.1.103', bleAddress: 'D0:03', connected: false, battery: 88, color: 0x0000ff, x: 0, y: 0, z: 0, yaw: 0, pitch: 0, roll: 0, targetReached: false },
+    ];
+    setDrones(initialDrones);
+    addLog('System initialisiert - 10-Anker BLE AoA System bereit');
+  }, []);
+
+  // Initialisiere Three.js Scene
+  useEffect(() => {
+    if (!canvasRef.current) return;
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x1a1a2e);
+    sceneRef.current = scene;
+
+    const camera = new THREE.PerspectiveCamera(75, canvasRef.current.clientWidth / canvasRef.current.clientHeight, 0.1, 1000);
+    camera.position.set(20, 20, 20);
+    camera.lookAt(0, 0, 0);
+    cameraRef.current = camera;
+
+    const renderer = new THREE.WebGLRenderer({ canvas: canvasRef.current, antialias: true });
+    renderer.setSize(canvasRef.current.clientWidth, canvasRef.current.clientHeight);
+    rendererRef.current = renderer;
+
+    // Grid (25x25m)
+    const gridHelper = new THREE.GridHelper(25, 25, 0x444444, 0x222222);
+    scene.add(gridHelper);
+
+    // Achsen
+    const axesHelper = new THREE.AxesHelper(5);
+    scene.add(axesHelper);
+
+    // Beleuchtung
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+    scene.add(ambientLight);
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    directionalLight.position.set(10, 10, 10);
+    scene.add(directionalLight);
+
+    // Drohnen-Modelle
+    drones.forEach((drone, index) => {
+      const geometry = new THREE.ConeGeometry(0.3, 0.8, 4);
+      const material = new THREE.MeshPhongMaterial({ color: drone.color });
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.rotation.x = Math.PI;
+      mesh.position.set(index * 3 - 3, 0, 0);
+      scene.add(mesh);
+      droneModelsRef.current.push(mesh);
+    });
+
+    // Anker-Modelle
+    anchors.forEach((anchor) => {
+      const geometry = new THREE.BoxGeometry(0.5, 0.5, 0.5);
+      const material = new THREE.MeshPhongMaterial({ color: 0xffaa00, emissive: 0xff6600 });
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.position.set(anchor.x, anchor.z, -anchor.y);
+      scene.add(mesh);
+      
+      // Label
+      const canvas = document.createElement('canvas');
+      const context = canvas.getContext('2d');
+      canvas.width = 64;
+      canvas.height = 32;
+      context.fillStyle = '#ffffff';
+      context.font = 'Bold 20px Arial';
+      context.textAlign = 'center';
+      context.fillText(anchor.name, 32, 20);
+      
+      const texture = new THREE.CanvasTexture(canvas);
+      const spriteMaterial = new THREE.SpriteMaterial({ map: texture });
+      const sprite = new THREE.Sprite(spriteMaterial);
+      sprite.position.set(anchor.x, anchor.z + 0.8, -anchor.y);
+      sprite.scale.set(2, 1, 1);
+      scene.add(sprite);
+      
+      anchorModelsRef.current.push(mesh);
+    });
+
+    // Maus-Steuerung
+    let isDragging = false;
+    let previousMousePosition = { x: 0, y: 0 };
+
+    const onMouseDown = (e) => {
+      isDragging = true;
+      previousMousePosition = { x: e.clientX, y: e.clientY };
+    };
+
+    const onMouseMove = (e) => {
+      if (!isDragging) return;
+      
+      const deltaX = e.clientX - previousMousePosition.x;
+      const deltaY = e.clientY - previousMousePosition.y;
+
+      const radius = Math.sqrt(camera.position.x ** 2 + camera.position.z ** 2);
+      const angle = Math.atan2(camera.position.z, camera.position.x);
+      
+      const newAngle = angle - deltaX * 0.01;
+      camera.position.x = radius * Math.cos(newAngle);
+      camera.position.z = radius * Math.sin(newAngle);
+      camera.position.y = Math.max(1, camera.position.y - deltaY * 0.1);
+      
+      camera.lookAt(0, 0, 0);
+      previousMousePosition = { x: e.clientX, y: e.clientY };
+    };
+
+    const onMouseUp = () => {
+      isDragging = false;
+    };
+
+    const onWheel = (e) => {
+      e.preventDefault();
+      const radius = Math.sqrt(camera.position.x ** 2 + camera.position.y ** 2 + camera.position.z ** 2);
+      const newRadius = Math.max(5, Math.min(50, radius + e.deltaY * 0.01));
+      const scale = newRadius / radius;
+      camera.position.multiplyScalar(scale);
+    };
+
+    canvasRef.current.addEventListener('mousedown', onMouseDown);
+    canvasRef.current.addEventListener('mousemove', onMouseMove);
+    canvasRef.current.addEventListener('mouseup', onMouseUp);
+    canvasRef.current.addEventListener('wheel', onWheel);
+
+    const animate = () => {
+      animationFrameRef.current = requestAnimationFrame(animate);
+      renderer.render(scene, camera);
+    };
+    animate();
+
+    return () => {
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
+      canvasRef.current?.removeEventListener('mousedown', onMouseDown);
+      canvasRef.current?.removeEventListener('mousemove', onMouseMove);
+      canvasRef.current?.removeEventListener('mouseup', onMouseUp);
+      canvasRef.current?.removeEventListener('wheel', onWheel);
+      renderer.dispose();
+    };
+  }, [drones, anchors]);
+
+  // Update Pfade
+  useEffect(() => {
+    if (!sceneRef.current) return;
+
+    pathLinesRef.current.forEach(line => sceneRef.current.remove(line));
+    pathLinesRef.current = [];
+
+    drones.forEach((drone) => {
+      const droneKeyframes = keyframes.filter(kf => kf.droneId === drone.id).sort((a, b) => a.time - b.time);
+      
+      if (droneKeyframes.length < 2) return;
+
+      const points = [];
+      for (let i = 0; i < droneKeyframes.length - 1; i++) {
+        const kf1 = droneKeyframes[i];
+        const kf2 = droneKeyframes[i + 1];
+        
+        const steps = Math.max(10, Math.floor((kf2.time - kf1.time) * 10));
+        for (let t = 0; t <= steps; t++) {
+          const alpha = t / steps;
+          const interpolated = interpolate(kf1, kf2, alpha);
+          points.push(new THREE.Vector3(interpolated.x, interpolated.z, -interpolated.y));
+        }
+      }
+
+      if (points.length > 0) {
+        const geometry = new THREE.BufferGeometry().setFromPoints(points);
+        const material = new THREE.LineBasicMaterial({ color: drone.color, linewidth: 2 });
+        const line = new THREE.Line(geometry, material);
+        sceneRef.current.add(line);
+        pathLinesRef.current.push(line);
+      }
+    });
+  }, [keyframes, drones, interpolationMode]);
+
+  const interpolate = (kf1, kf2, t) => {
+    if (interpolationMode === 'linear') {
+      return {
+        x: kf1.x + (kf2.x - kf1.x) * t,
+        y: kf1.y + (kf2.y - kf1.y) * t,
+        z: kf1.z + (kf2.z - kf1.z) * t,
+        yaw: kf1.yaw + (kf2.yaw - kf1.yaw) * t,
+        pitch: kf1.pitch + (kf2.pitch - kf1.pitch) * t,
+        roll: kf1.roll + (kf2.roll - kf1.roll) * t,
+      };
+    } else if (interpolationMode === 'smooth') {
+      const smoothT = t * t * (3 - 2 * t);
+      return {
+        x: kf1.x + (kf2.x - kf1.x) * smoothT,
+        y: kf1.y + (kf2.y - kf1.y) * smoothT,
+        z: kf1.z + (kf2.z - kf1.z) * smoothT,
+        yaw: kf1.yaw + (kf2.yaw - kf1.yaw) * smoothT,
+        pitch: kf1.pitch + (kf2.pitch - kf1.pitch) * smoothT,
+        roll: kf1.roll + (kf2.roll - kf1.roll) * smoothT,
+      };
+    }
+    return kf1;
+  };
+
+  const addLog = (message) => {
+    const timestamp = new Date().toLocaleTimeString('de-DE');
+    setLog(prev => [{time: timestamp, message}, ...prev].slice(0, 50));
+  };
+
+  const toggleConnection = (droneId) => {
+    setDrones(prev => prev.map(d => 
+      d.id === droneId ? { ...d, connected: !d.connected } : d
+    ));
+    const drone = drones.find(d => d.id === droneId);
+    addLog(`${drone.name}: ${drone.connected ? 'Getrennt' : 'Verbunden'}`);
+  };
+
+  const connectBLE = () => {
+    setBleConnected(!bleConnected);
+    addLog(`BLE AoA System: ${!bleConnected ? 'Verbunden' : 'Getrennt'}`);
+    if (!bleConnected) {
+      addLog('10 Anker erkannt - Genauigkeit: 0,1-0,3m');
+    }
+  };
+
+  const addKeyframe = (droneId) => {
+    const maxTime = keyframes.length > 0 ? Math.max(...keyframes.map(kf => kf.time)) + 1 : 0;
+    const newKeyframe = {
+      id: Date.now(),
+      droneId,
+      time: maxTime,
+      x: 0,
+      y: 0,
+      z: 2,
+      yaw: 0,
+      pitch: 0,
+      roll: 0
+    };
+    setKeyframes([...keyframes, newKeyframe]);
+    addLog(`Keyframe hinzugefügt für ${drones.find(d => d.id === droneId)?.name} @ ${maxTime}s`);
+  };
+
+  const updateKeyframe = (keyframeId, field, value) => {
+    setKeyframes(prev => prev.map(kf => 
+      kf.id === keyframeId ? { ...kf, [field]: parseFloat(value) || 0 } : kf
+    ));
+  };
+
+  const deleteKeyframe = (keyframeId) => {
+    setKeyframes(prev => prev.filter(kf => kf.id !== keyframeId));
+  };
+
+  const uploadMissionToDrone = (droneId) => {
+    const drone = drones.find(d => d.id === droneId);
+    if (!drone.connected) {
+      addLog(`Fehler: ${drone.name} nicht verbunden!`);
+      return;
+    }
+
+    const droneKeyframes = keyframes.filter(kf => kf.droneId === droneId).sort((a, b) => a.time - b.time);
+    if (droneKeyframes.length === 0) {
+      addLog(`Fehler: Keine Keyframes für ${drone.name}`);
+      return;
+    }
+
+    // Generiere Arduino-Code
+    const arduinoCode = generateArduinoCode(drone, droneKeyframes);
+    
+    addLog(`Mission hochgeladen zu ${drone.name}: ${droneKeyframes.length} Keyframes`);
+    addLog(`Arduino-Code generiert (siehe Console)`);
+    console.log(arduinoCode);
+  };
+
+  const generateArduinoCode = (drone, keyframes) => {
+    const kfData = keyframes.map(kf => 
+      `  {${kf.time}f, ${kf.x}f, ${kf.y}f, ${kf.z}f, ${kf.yaw}f, ${kf.pitch}f, ${kf.roll}f}`
+    ).join(',\n');
+
+    return `// Auto-generated mission for ${drone.name}
+// BLE Address: ${drone.bleAddress}
+
+struct Keyframe {
+  float time;
+  float x, y, z;
+  float yaw, pitch, roll;
+};
+
+const int numKeyframes = ${keyframes.length};
+Keyframe mission[] = {
+${kfData}
+};
+
+// PID Controller
+struct PID {
+  float kp = 1.0, ki = 0.1, kd = 0.5;
+  float integral = 0, lastError = 0;
+  
+  float calculate(float error, float dt) {
+    integral += error * dt;
+    float derivative = (error - lastError) / dt;
+    lastError = error;
+    return kp * error + ki * integral + kd * derivative;
+  }
+};
+
+PID pidX, pidY, pidZ, pidYaw;
+
+// Aktuelle Position (von BLE AoA System)
+float currentX = 0, currentY = 0, currentZ = 0;
+float currentYaw = 0;
+
+// Interpolation zwischen Keyframes
+void interpolateKeyframe(float t, float &x, float &y, float &z, float &yaw, float &pitch, float &roll) {
+  int idx = 0;
+  for (int i = 0; i < numKeyframes - 1; i++) {
+    if (mission[i].time <= t && mission[i+1].time >= t) {
+      idx = i;
+      break;
+    }
+  }
+  
+  float t1 = mission[idx].time;
+  float t2 = mission[idx+1].time;
+  float alpha = (t - t1) / (t2 - t1);
+  
+  // Smooth interpolation
+  alpha = alpha * alpha * (3 - 2 * alpha);
+  
+  x = mission[idx].x + (mission[idx+1].x - mission[idx].x) * alpha;
+  y = mission[idx].y + (mission[idx+1].y - mission[idx+1].y) * alpha;
+  z = mission[idx].z + (mission[idx+1].z - mission[idx].z) * alpha;
+  yaw = mission[idx].yaw + (mission[idx+1].yaw - mission[idx].yaw) * alpha;
+  pitch = mission[idx].pitch + (mission[idx+1].pitch - mission[idx].pitch) * alpha;
+  roll = mission[idx].roll + (mission[idx+1].roll - mission[idx].roll) * alpha;
+}
+
+void setup() {
+  Serial.begin(115200);
+  // BLE AoA Setup
+  setupBLEPositioning();
+  // Motor/ESC Setup
+  setupMotors();
+}
+
+void loop() {
+  static unsigned long startTime = millis();
+  float missionTime = (millis() - startTime) / 1000.0f;
+  
+  // Update Position von BLE AoA System
+  updateBLEPosition(&currentX, &currentY, &currentZ, &currentYaw);
+  
+  // Ziel-Position aus Mission
+  float targetX, targetY, targetZ, targetYaw, targetPitch, targetRoll;
+  interpolateKeyframe(missionTime, targetX, targetY, targetZ, targetYaw, targetPitch, targetRoll);
+  
+  // PID Kontrolle
+  float errorX = targetX - currentX;
+  float errorY = targetY - currentY;
+  float errorZ = targetZ - currentZ;
+  float errorYaw = targetYaw - currentYaw;
+  
+  float controlX = pidX.calculate(errorX, 0.01);
+  float controlY = pidY.calculate(errorY, 0.01);
+  float controlZ = pidZ.calculate(errorZ, 0.01);
+  float controlYaw = pidYaw.calculate(errorYaw, 0.01);
+  
+  // SBUS Output generieren
+  generateSBUS(controlX, controlY, controlZ, controlYaw, targetPitch, targetRoll);
+  
+  // Telemetrie senden
+  sendTelemetry();
+  
+  delay(10); // 100Hz Loop
+}`;
+  };
+
+  const loadMission = () => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json';
+    input.onchange = (e) => {
+      const file = e.target.files[0];
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        try {
+          const data = JSON.parse(event.target.result);
+          setKeyframes(data.keyframes || []);
+          setInterpolationMode(data.interpolationMode || 'smooth');
+          if (data.anchors) setAnchors(data.anchors);
+          addLog(`Mission geladen: ${data.keyframes?.length || 0} Keyframes`);
+        } catch (err) {
+          addLog('Fehler beim Laden der Mission');
+        }
+      };
+      reader.readAsText(file);
+    };
+    input.click();
+  };
+
+  const saveMission = () => {
+    const data = {
+      version: '2.0',
+      interpolationMode,
+      anchors,
+      keyframes
+    };
+    const dataStr = JSON.stringify(data, null, 2);
+    const dataBlob = new Blob([dataStr], { type: 'application/json' });
+    const url = URL.createObjectURL(dataBlob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `mission_10anchor_${Date.now()}.json`;
+    link.click();
+    addLog(`Mission gespeichert: ${keyframes.length} Keyframes, 10 Anker`);
+  };
+
+  const startPlayback = () => {
+    const connectedDrones = drones.filter(d => d.connected);
+    if (connectedDrones.length === 0) {
+      addLog('Fehler: Keine Drohnen verbunden!');
+      return;
+    }
+    if (keyframes.length === 0) {
+      addLog('Fehler: Keine Keyframes definiert!');
+      return;
+    }
+
+    setIsPlaying(true);
+    setPlaybackTime(0);
+    addLog(`Mission gestartet - BLE AoA Tracking aktiv`);
+
+    const maxTime = Math.max(...keyframes.map(kf => kf.time));
+    let currentTime = 0;
+
+    playbackIntervalRef.current = setInterval(() => {
+      if (currentTime > maxTime) {
+        stopPlayback();
+        return;
+      }
+
+      setPlaybackTime(currentTime);
+
+      droneModelsRef.current.forEach((model, index) => {
+        const drone = drones[index];
+        if (!drone.connected) return;
+
+        const droneKeyframes = keyframes
+          .filter(kf => kf.droneId === drone.id)
+          .sort((a, b) => a.time - b.time);
+
+        if (droneKeyframes.length === 0) return;
+
+        let kf1 = droneKeyframes[0];
+        let kf2 = droneKeyframes[droneKeyframes.length - 1];
+
+        for (let i = 0; i < droneKeyframes.length - 1; i++) {
+          if (droneKeyframes[i].time <= currentTime && droneKeyframes[i + 1].time >= currentTime) {
+            kf1 = droneKeyframes[i];
+            kf2 = droneKeyframes[i + 1];
+            break;
+          }
+        }
+
+        const t = kf2.time > kf1.time ? (currentTime - kf1.time) / (kf2.time - kf1.time) : 0;
+        const pos = interpolate(kf1, kf2, Math.max(0, Math.min(1, t)));
+
+        model.position.set(pos.x, pos.z, -pos.y);
+        model.rotation.set(
+          THREE.MathUtils.degToRad(pos.pitch),
+          THREE.MathUtils.degToRad(pos.yaw),
+          THREE.MathUtils.degToRad(pos.roll)
+        );
+
+        // Update Drohnen-Daten
+        setDrones(prev => prev.map(d => 
+          d.id === drone.id ? { ...d, x: pos.x, y: pos.y, z: pos.z, yaw: pos.yaw } : d
+        ));
+      });
+
+      currentTime += 0.1;
+    }, 100);
+  };
+
+  const stopPlayback = () => {
+    if (playbackIntervalRef.current) {
+      clearInterval(playbackIntervalRef.current);
+      playbackIntervalRef.current = null;
+    }
+    setIsPlaying(false);
+    addLog('Playback gestoppt');
+  };
+
+  const emergencyStop = () => {
+    stopPlayback();
+    droneModelsRef.current.forEach(model => {
+      model.position.set(model.position.x, 0, model.position.z);
+    });
+    addLog('NOTAUS! Alle Drohnen landen!');
+  };
+
+  const createFormation = (formationType) => {
+    const connectedDrones = drones.filter(d => d.connected);
+    if (connectedDrones.length === 0) {
+      addLog('Keine verbundenen Drohnen für Formation');
+      return;
+    }
+
+    const time = keyframes.length > 0 ? Math.max(...keyframes.map(kf => kf.time)) + 1 : 0;
+    const radius = 5;
+
+    connectedDrones.forEach((drone, index) => {
+      let x, y, z;
+      
+      if (formationType === 'circle') {
+        const angle = (index / connectedDrones.length) * Math.PI * 2;
+        x = Math.cos(angle) * radius;
+        y = Math.sin(angle) * radius;
+        z = 3;
+      } else if (formationType === 'line') {
+        x = index * 3 - connectedDrones.length * 1.5;
+        y = 0;
+        z = 3;
+      } else if (formationType === 'triangle') {
+        const angle = (index / connectedDrones.length) * Math.PI * 2;
+        x = Math.cos(angle) * radius;
+        y = Math.sin(angle) * radius;
+        z = index * 0.5 + 3;
+      }
+
+      const newKeyframe = {
+        id: Date.now() + index,
+        droneId: drone.id,
+        time,
+        x, y, z,
+        yaw: 0, pitch: 0, roll: 0
+      };
+      setKeyframes(prev => [...prev, newKeyframe]);
+    });
+
+    addLog(`Formation "${formationType}" erstellt @ ${time}s`);
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-900 text-white p-4">
+      <div className="max-w-7xl mx-auto">
+        <h1 className="text-3xl font-bold mb-4 text-center">Multi-Drone Mission Planner</h1>
+        <div className="text-center text-sm text-gray-400 mb-4">10-Anker BLE AoA System (25x25m) - Autopilot Ready</div>
+        
+        <div className="grid grid-cols-1 lg:grid-cols-4 gap-4 mb-4">
+          {/* 3D Viewport */}
+          <div className="lg:col-span-3 bg-gray-800 rounded-lg p-4">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-xl font-semibold">3D Viewport (25m x 25m)</h2>
+              <div className="flex gap-2">
+                <button 
+                  onClick={connectBLE}
+                  className={`${bleConnected ? 'bg-green-600' : 'bg-gray-600'} hover:opacity-80 px-3 py-1 rounded text-sm flex items-center gap-2`}
+                >
+                  <Radio className="w-4 h-4" />
+                  {bleConnected ? 'BLE Verbunden' : 'BLE Trennen'}
+                </button>
+                <select 
+                  value={interpolationMode}
+                  onChange={(e) => setInterpolationMode(e.target.value)}
+                  className="bg-gray-700 px-3 py-1 rounded text-sm"
+                >
+                  <option value="linear">Linear</option>
+                  <option value="smooth">Smooth</option>
+                </select>
+                <button onClick={() => createFormation('circle')} className="bg-purple-600 hover:bg-purple-700 px-3 py-1 rounded text-sm">
+                  Kreis
+                </button>
+                <button onClick={() => createFormation('line')} className="bg-purple-600 hover:bg-purple-700 px-3 py-1 rounded text-sm">
+                  Linie
+                </button>
+                <button 
+                  onClick={() => setShowAnchorSetup(!showAnchorSetup)}
+                  className="bg-orange-600 hover:bg-orange-700 px-3 py-1 rounded text-sm flex items-center gap-1"
+                >
+                  <Settings className="w-4 h-4" />
+                  Anker
+                </button>
+              </div>
+            </div>
+            <canvas ref={canvasRef} className="w-full h-96 rounded bg-gray-900" />
+            
+            {/* Timeline */}
+            <div className="mt-4 bg-gray-700 rounded p-3">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-sm font-semibold">Timeline</span>
+                <span className="text-sm text-gray-400">Zeit: {playbackTime.toFixed(1)}s</span>
+              </div>
+              <div className="relative h-12 bg-gray-800 rounded overflow-hidden">
+                {keyframes.map(kf => {
+                  const drone = drones.find(d => d.id === kf.droneId);
+                  const maxTime = Math.max(10, ...keyframes.map(k => k.time));
+                  const left = (kf.time / maxTime) * 100;
+                  return (
+                    <div
+                      key={kf.id}
+                      onClick={() => setSelectedKeyframe(kf.id)}
+                      className={`absolute top-0 w-2 h-full cursor-pointer hover:opacity-80 ${selectedKeyframe === kf.id ? 'ring-2 ring-white' : ''}`}
+                      style={{
+                        left: `${left}%`,
+                        backgroundColor: `#${drone?.color.toString(16).padStart(6, '0')}`
+                      }}
+                      title={`${drone?.name} @ ${kf.time}s`}
+                    />
+                  );
+                })}
+                {isPlaying && (
+                  <div
+                    className="absolute top-0 w-0.5 h-full bg-yellow-400"
+                    style={{ left: `${(playbackTime / Math.max(10, ...keyframes.map(k => k.time))) * 100}%` }}
+                  />
+                )}
+              </div>
+            </div>
+
+            <div className="mt-4 flex gap-2">
+              <button onClick={loadMission} className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded flex items-center gap-2">
+                <Upload className="w-4 h-4" /> Laden
+              </button>
+              <button onClick={saveMission} className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded flex items-center gap-2">
+                <Download className="w-4 h-4" /> Speichern
+              </button>
+              <button
+                onClick={isPlaying ? stopPlayback : startPlayback}
+                className={`flex-1 ${isPlaying ? 'bg-yellow-600 hover:bg-yellow-700' : 'bg-green-600 hover:bg-green-700'} px-4 py-2 rounded flex items-center justify-center gap-2`}
+              >
+                {isPlaying ? <Square className="w-4 h-4" /> : <Play className="w-4 h-4" />}
+                {isPlaying ? 'Stop' : 'Play'}
+              </button>
+              <button onClick={emergencyStop} className="bg-red-600 hover:bg-red-700 px-4 py-2 rounded flex items-center gap-2">
+                <AlertCircle className="w-4 h-4" /> NOTAUS
+              </button>
+            </div>
+          </div>
+
+          {/* Sidebar */}
+          <div className="space-y-4">
+            {/* Drohnen Status */}
+            <div className="bg-gray-800 rounded-lg p-4">
+              <h2 className="text-xl font-semibold mb-4 flex items-center gap-2">
+                <Wifi className="w-5 h-5" />
+                Drohnen
+              </h2>
+              <div className="space-y-2">
+                {drones.map(drone => (
+                  <div key={drone.id} className="bg-gray-700 rounded p-2">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-2">
+                        <div className="w-3 h-3 rounded-full" style={{ backgroundColor: `#${drone.color.toString(16).padStart(6, '0')}` }} />
+                        <span className="font-semibold text-sm">{drone.name}</span>
+                      </div>
+                      <button
+                        onClick={() => toggleConnection(drone.id)}
+                        className={`p-1 rounded ${drone.connected ? 'bg-green-600' : 'bg-red-600'}`}
+                      >
+                        {drone.connected ? <Wifi className="w-3 h-3" /> : <WifiOff className="w-3 h-3" />}
+                      </button>
+                    </div>
+                    <div className="text-xs text-gray-300 mb-2">
+                      <div>BLE: {drone.bleAddress}</div>
+                      <div>Pos: ({drone.x.toFixed(1)}, {drone.y.toFixed(1)}, {drone.z.toFixed(1)})</div>
+                    </div>
+                    <div className="flex gap-1">
+                      <button
+                        onClick={() => addKeyframe(drone.id)}
+                        className="flex-1 bg-blue-600 hover:bg-blue-700 py-1 rounded text-xs flex items-center justify-center gap-1"
+                      >
+                        <Plus className="w-3 h-3" /> Keyframe
+                      </button>
+                      <button
+                        onClick={() => uploadMissionToDrone(drone.id)}
+                        className="flex-1 bg-green-600 hover:bg-green-700 py-1 rounded text-xs flex items-center justify-center gap-1"
+                      >
+                        <Target className="w-3 h-3" /> Upload
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Anker Setup */}
+            {showAnchorSetup && (
+              <div className="bg-gray-800 rounded-lg p-4">
+                <h2 className="text-xl font-semibold mb-4">Anker-Setup</h2>
+                <div className="max-h-64 overflow-y-auto space-y-1 text-xs">
+                  {anchors.map(anchor => (
+                    <div key={anchor.id} className="bg-gray-700 rounded p-2 flex items-center justify-between">
+                      <span className="font-semibold">{anchor.name}</span>
+                      <span className="text-gray-400">
+                        ({anchor.x.toFixed(1)}, {anchor.y.toFixed(1)}, {anchor.z.toFixed(1)})
+                      </span>
+                      <div className={`w-2 h-2 rounded-full ${anchor.active ? 'bg-green-500' : 'bg-red-500'}`} />
+                    </div>
+                  ))}
+                </div>
+                <div className="mt-2 text-xs text-gray-400">
+                  Genauigkeit: 0,1-0,3m (10 Anker)
+                </div>
+              </div>
+            )}
+
+            {/* Keyframe Editor */}
+            <div className="bg-gray-800 rounded-lg p-4">
+              <h2 className="text-xl font-semibold mb-4">Keyframes</h2>
+              <div className="max-h-96 overflow-y-auto space-y-2">
+                {keyframes.sort((a, b) => a.time - b.time).map(kf => {
+                  const drone = drones.find(d => d.id === kf.droneId);
+                  return (
+                    <div key={kf.id} className={`bg-gray-700 rounded p-2 text-xs ${selectedKeyframe === kf.id ? 'ring-2 ring-blue-500' : ''}`}>
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="font-semibold" style={{ color: `#${drone?.color.toString(16).padStart(6, '0')}` }}>
+                          {drone?.name}
+                        </span>
+                        <button onClick={() => deleteKeyframe(kf.id)} className="text-red-500 hover:text-red-400">
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                      </div>
+                      <div className="grid grid-cols-2 gap-1">
+                        <input
+                          type="number"
+                          value={kf.time}
+                          onChange={(e) => updateKeyframe(kf.id, 'time', e.target.value)}
+                          className="bg-gray-600 rounded px-1 py-0.5"
+                          placeholder="Zeit"
+                          step="0.1"
+                        />
+                        <input
+                          type="number"
+                          value={kf.x}
+                          onChange={(e) => updateKeyframe(kf.id, 'x', e.target.value)}
+                          className="bg-gray-600 rounded px-1 py-0.5"
+                          placeholder="X"
+                          step="0.1"
+                        />
+                        <input
+                          type="number"
+                          value={kf.y}
+                          onChange={(e) => updateKeyframe(kf.id, 'y', e.target.value)}
+                          className="bg-gray-600 rounded px-1 py-0.5"
+                          placeholder="Y"
+                          step="0.1"
+                        />
+                        <input
+                          type="number"
+                          value={kf.z}
+                          onChange={(e) => updateKeyframe(kf.id, 'z', e.target.value)}
+                          className="bg-gray-600 rounded px-1 py-0.5"
+                          placeholder="Z"
+                          step="0.1"
+                        />
+                        <input
+                          type="number"
+                          value={kf.yaw}
+                          onChange={(e) => updateKeyframe(kf.id, 'yaw', e.target.value)}
+                          className="bg-gray-600 rounded px-1 py-0.5"
+                          placeholder="Yaw"
+                          step="1"
+                        />
+                        <input
+                          type="number"
+                          value={kf.pitch}
+                          onChange={(e) => updateKeyframe(kf.id, 'pitch', e.target.value)}
+                          className="bg-gray-600 rounded px-1 py-0.5"
+                          placeholder="Pitch"
+                          step="1"
+                        />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Event Log */}
+        <div className="bg-gray-800 rounded-lg p-4">
+          <h2 className="text-xl font-semibold mb-4">Event Log</h2>
+          <div className="bg-gray-900 rounded p-3 h-32 overflow-y-auto font-mono text-sm">
+            {log.map((entry, index) => (
+              <div key={index} className="mb-1">
+                <span className="text-gray-400">[{entry.time}]</span> {entry.message}
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default MultiDroneControl;

@@ -1,0 +1,35 @@
+{
+  "name": "drone-bridge-server",
+  "version": "2.0.0",
+  "description": "WebSocket to Serial/UDP bridge for ESP32 drone communication with AoA Locator system launcher",
+  "main": "serial-bridge.js",
+  "scripts": {
+    "start": "node serial-bridge.js",
+    "start:serial": "node serial-bridge.js",
+    "start:udp": "node udp-bridge.js",
+    "start:launcher": "node launcher-api.js",
+    "start:all": "concurrently \"npm run start:serial\" \"npm run start:launcher\""
+  },
+  "keywords": [
+    "drone",
+    "websocket",
+    "udp",
+    "serial",
+    "bridge",
+    "esp32",
+    "aoa",
+    "launcher"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@serialport/parser-readline": "^12.0.0",
+    "cors": "^2.8.5",
+    "express": "^4.22.1",
+    "serialport": "^12.0.0",
+    "ws": "^8.14.2"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

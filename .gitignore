@@ -1,0 +1,8 @@
+node_modules/
+logs/
+*.log
+.env
+.claude/
+.__smb*
+.history/
+Oringinal/ESP-Drone/
