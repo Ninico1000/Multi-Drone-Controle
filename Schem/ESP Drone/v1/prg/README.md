@@ -12,6 +12,7 @@ Missions are planned in **Multi-Drone-Control** and exported as JSON to the SD c
 |-----------|------|-----------|
 | MCU | ESP32-S2-WROVER (240 MHz, 4 MB Flash, 2 MB PSRAM) | — |
 | IMU | MPU-6050 (6-axis accel + gyro) | I2C bus 0 |
+| Barometer | BMP280 (pressure + temperature) | I2C bus 0 (shared with IMU) |
 | Radio | SX1262IMLTRT (LoRa 868/915 MHz, +22 dBm max) | SPI HSPI |
 | GPS | GEPRC M10 FPV (u-blox M10, 38400 Bd) | UART1 |
 | Power | TPS563200 (buck, 4.5–17 V → 5 V, 3 A) | — |
@@ -124,9 +125,10 @@ LoRa replaces WiFi entirely. All packets are UTF-8 JSON, ≤ 200 bytes.
 | `{"cmd":"ping"}` | Drone replies with `{"type":"pong","id":N}` |
 | `{"cmd":"start"}` | Begin executing mission loaded from SD |
 | `{"cmd":"stop"}` | Stop mission, disarm |
-| `{"cmd":"emergency"}` | Immediate motor cutoff |
+| `{"cmd":"land"}` | **Soft emergency:** controlled descent at 0.4 m/s until touchdown |
+| `{"cmd":"emergency"}` | **Hard cutoff:** immediate motor stop |
 | `{"cmd":"arm","thr":500,"r":0,"p":0,"y":0,"mode":1}` | Manual stabilize |
-| `{"cmd":"reload"}` | Re-read `/mission.json` from SD card |
+| `{"cmd":"reload"}` | Re-parse mission from RAM cache (no SD access) |
 
 ### Telemetry: Drone → Ground (every 200 ms)
 
@@ -135,6 +137,7 @@ LoRa replaces WiFi entirely. All packets are UTF-8 JSON, ≤ 200 bytes.
   "id": 1,
   "r": 0.1,   "p": -0.2,  "y": 3.1,
   "lat": 48.123456,  "lng": 11.456789,  "alt": 502.1,
+  "agl": 2.3,  "pres": 1013.2,  "temp": 22.1,
   "arm": 1,  "mode": 2,  "wp": 12,  "bat": 0
 }
 ```
@@ -143,9 +146,12 @@ LoRa replaces WiFi entirely. All packets are UTF-8 JSON, ≤ 200 bytes.
 |-------|-------------|
 | `id` | Drone ID |
 | `r/p/y` | Roll / pitch (°), yaw rate (°/s) |
-| `lat/lng/alt` | GPS position |
+| `lat/lng/alt` | GPS position (alt = GPS altitude MSL) |
+| `agl` | Barometer altitude AGL (relative to arm point, metres) |
+| `pres` | Barometric pressure (hPa) |
+| `temp` | BMP280 temperature (°C) |
 | `arm` | 1 = armed |
-| `mode` | 0=disarmed 1=stabilize 2=mission 3=return |
+| `mode` | 0=disarmed 1=stabilize 2=mission 3=RTH 4=landing |
 | `wp` | Current waypoint index |
 | `bat` | Battery mV (0 = not wired) |
 
@@ -179,7 +185,7 @@ gps_baud=38400
 ### `/mission.json`
 
 Exported from **Multi-Drone-Control → Mission Export**.
-The drone reads this file at boot (and on `{"cmd":"reload"}`).
+Loaded into RAM at boot; `{"cmd":"reload"}` re-parses from RAM without SD access.
 
 ```json
 {
@@ -197,16 +203,32 @@ The drone reads this file at boot (and on `{"cmd":"reload"}`).
     }
   },
   "waypoints": [
-    { "time": 0,   "x": 0, "y": 0, "z": 2, "yaw": 0, "pitch": 0, "roll": 0,
-      "r": 0, "g": 200, "b": 255 },
-    { "time": 0.5, "x": 0.1, "y": 0.2, "z": 2.1, "yaw": 5, "pitch": 0, "roll": 0,
-      "r": 0, "g": 200, "b": 255 }
+    { "time": 0,   "x": 0,   "y": 0,   "z": 2,   "r": 0, "g": 200, "b": 255, "fn": 0, "fp": 0 },
+    { "time": 0.5, "x": 0.1, "y": 0.2, "z": 2.1, "r": 0, "g": 200, "b": 255, "fn": 1, "fp": 1000 }
   ]
 }
 ```
 
-**Coordinate frame:** `x` = East, `y` = North, `z` = Up (metres, relative to `homePoint`).
+**Coordinate frame:** `x` = East, `y` = North, `z` = Up AGL (metres from arm point, barometer).
 **Max waypoints:** 400 (≈ 200 s at 0.5 s interval).
+**Angle fields removed** — attitude is computed entirely from position error.
+
+#### LED Color Functions (`fn` / `fp`)
+
+| `fn` | Name | `fp` meaning |
+|------|------|--------------|
+| `0` | solid | — |
+| `1` | pulse | period in ms (e.g. 1000 = 1 s breathing) |
+| `2` | strobe | blink interval in ms (e.g. 200 = 5 Hz) |
+
+### `/bb_<id>.csv`
+
+Blackbox log written automatically each armed session.
+CSV columns: `t_ms, roll, pitch, yaw_r, agl, pres, m1, m2, m3, m4, mode, wp`
+
+- Written at ~25 Hz, flushed to SD every 2 s.
+- Ring buffer of 400 records in RAM; oldest overwritten if flush falls behind.
+- File overwritten each boot (append if long-term logging is needed).
 
 ---
 
@@ -216,12 +238,16 @@ The drone reads this file at boot (and on `{"cmd":"reload"}`).
 |------|-------|-------------|
 | Disarmed | 0 | Motors off, PIDs reset |
 | Stabilize | 1 | Manual control via LoRa `arm` command |
-| Mission | 2 | Auto-execute `/mission.json` waypoints with GPS |
-| Return | 3 | Reserved — fly to `homePoint` |
+| Mission | 2 | Auto-execute `/mission.json` waypoints |
+| RTH | 3 | Return-to-Home (geofence breach) |
+| Land | 4 | Soft emergency: controlled descent at 0.4 m/s |
 
-In **Mission mode** with GPS fix the drone uses a flat-earth ENU position loop:
-position error (m) → attitude setpoints → attitude PID → motor mix.
-Without GPS fix it falls back to the waypoint's `roll`/`pitch`/`yaw` fields directly.
+**Mission mode:** GPS for horizontal position, barometer for altitude.
+Without GPS fix: attitude held level, altitude controlled by barometer only.
+
+**Emergency modes:**
+- `{"cmd":"land"}` → mode 4 — descends at 0.4 m/s, disarms at 15 cm AGL
+- `{"cmd":"emergency"}` → immediate motor cutoff, no descent
 
 ---
 
@@ -246,6 +272,8 @@ In mission mode the side LEDs track the interpolated `r,g,b` colour from the act
 | `MPU6050_light` | Arduino Library Manager |
 | `TinyGPSPlus` | Arduino Library Manager |
 | `Adafruit NeoPixel` | Arduino Library Manager |
+| `Adafruit BMP280 Library` | Arduino Library Manager |
+| `Adafruit Unified Sensor` | Arduino Library Manager |
 | `ArduinoJson` | Arduino Library Manager |
 | `SD` | Arduino built-in |
 

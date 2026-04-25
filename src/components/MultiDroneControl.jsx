@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Upload, Download, Play, Square, AlertCircle, Box, MapPin, Map } from 'lucide-react';
+import { Upload, Download, Play, Square, AlertCircle, Box, MapPin, Map, RefreshCw } from 'lucide-react';
+import { useLanguage } from '../i18n';
 import * as THREE from 'three';
 import ThreeScene from './ThreeScene';
 import DronePanel from './DronePanel';
@@ -10,6 +11,7 @@ import EventLog from './EventLog';
 import ModelControls from './ModelControls';
 import MissionExport from './MissionExport';
 import HeightProfile from './HeightProfile';
+import BlackboxViewer from './BlackboxViewer';
 import { INITIAL_DRONES, DRONE_COLORS } from '../constants/defaults';
 import { interpolate, createFormationPositions } from '../utils/interpolation';
 import { saveMission, loadMission, load3DModel } from '../utils/fileOperations';
@@ -17,6 +19,7 @@ import { assignVerticesToDrones } from '../utils/modelUtils';
 import droneConnection from '../utils/droneConnection';
 
 const MultiDroneControl = () => {
+  const { lang, setLang, t } = useLanguage();
   const [drones, setDrones] = useState([]);
   const [keyframes, setKeyframes] = useState([]);
   const [selectedKeyframe, setSelectedKeyframe] = useState(null);
@@ -27,6 +30,8 @@ const MultiDroneControl = () => {
   const [interpolationMode, setInterpolationMode] = useState('smooth');
   const [bridgeConnected, setBridgeConnected] = useState(false);
   const [activeTab, setActiveTab] = useState('3d');
+  const [telemetry, setTelemetry] = useState({});
+  const [preflight, setPreflight] = useState({});
   const [gpsSettings, setGpsSettings] = useState({
     homePoint: null,
     emergencyPoint: null,
@@ -51,9 +56,11 @@ const MultiDroneControl = () => {
     setDrones(INITIAL_DRONES);
     addLog('System initialisiert — Koordinatenbasierte Drohnensteuerung');
 
-    const handleTelemetry = (droneIP, telemetryData) => {
+    const handleTelemetry = (droneIP, telemetryData, droneIdHint) => {
+      const idFromData = droneIdHint ?? telemetryData?.id ?? null;
       setDrones(prev => prev.map(d => {
-        if (d.ip === droneIP) {
+        const match = idFromData != null ? d.id === idFromData : d.ip === droneIP;
+        if (match) {
           return {
             ...d,
             x: telemetryData.x ?? d.x,
@@ -68,6 +75,9 @@ const MultiDroneControl = () => {
         }
         return d;
       }));
+      if (idFromData != null) {
+        setTelemetry(prev => ({ ...prev, [idFromData]: telemetryData }));
+      }
     };
 
     const handleStatus = (status) => {
@@ -80,6 +90,10 @@ const MultiDroneControl = () => {
         setTimeout(() => droneConnection.discoverDrones(), 500);
       } else if (status.type === 'ap_disconnected') {
         addLog('ESP32 Access Point getrennt');
+      }
+      if (status.type === 'preflight' && status.id != null) {
+        setPreflight(prev => ({ ...prev, [status.id]: status }));
+        addLog(`Vorflugcheck Drohne ${status.id}: ${status.ok ? 'OK' : status.fail}`);
       }
       if (status.message) addLog('Bridge: ' + status.message);
     };
@@ -100,7 +114,7 @@ const MultiDroneControl = () => {
                 connected: true,
                 battery: 100,
                 color: DRONE_COLORS[updated.length % DRONE_COLORS.length],
-                x: 0, y: 0, z: 0, yaw: 0, pitch: 0, roll: 0,
+                x: 0, y: 0, z: 0, yaw: 0,
                 targetReached: false
               });
             }
@@ -135,7 +149,7 @@ const MultiDroneControl = () => {
               x: i * 1.5,
               y: 0,
               z: 0,
-              yaw: 0, pitch: 0, roll: 0,
+              r: 255, g: 255, b: 255, colorFn: 0, colorFp: 0,
             });
           }
         });
@@ -186,7 +200,8 @@ const MultiDroneControl = () => {
 
   const addKeyframe = (droneId) => {
     const maxTime = keyframes.length > 0 ? Math.max(...keyframes.map(kf => kf.time)) + 1 : 0;
-    const newKf = { id: Date.now(), droneId, time: maxTime, x: 0, y: 0, z: 2, yaw: 0, pitch: 0, roll: 0 };
+    const newKf = { id: Date.now(), droneId, time: maxTime, x: 0, y: 0, z: 2,
+                    r: 255, g: 255, b: 255, colorFn: 0, colorFp: 0 };
     setKeyframes(prev => [...prev, newKf]);
     addLog('Keyframe hinzugefügt für ' + (drones.find(d => d.id === droneId)?.name) + ' @ ' + maxTime + 's');
   };
@@ -200,10 +215,10 @@ const MultiDroneControl = () => {
         id: Date.now() + i,
         droneId: drone.id,
         time: 0,
-        x: i * 1.5,  // slight offset so drones don't stack
+        x: i * 1.5,
         y: 0,
         z: 0,
-        yaw: 0, pitch: 0, roll: 0
+        r: 255, g: 255, b: 255, colorFn: 0, colorFp: 0,
       }));
     if (newKfs.length === 0) {
       addLog('Alle Drohnen haben bereits einen Startpunkt @ t=0');
@@ -253,6 +268,18 @@ const MultiDroneControl = () => {
     const drone = drones.find(d => d.id === droneId);
     try { await droneConnection.emergencyStop(drone.ip); addLog('NOTAUS ' + drone.name + '!'); }
     catch (error) { addLog('NOTAUS Fehler: ' + error.message); }
+  };
+
+  const softLandDrone = async (droneId) => {
+    const drone = drones.find(d => d.id === droneId);
+    if (!drone || !drone.connected || !bridgeConnected) return;
+    try { await droneConnection.softLand(drone.ip); addLog('Landen: ' + drone.name); }
+    catch (error) { addLog('Landen Fehler: ' + error.message); }
+  };
+
+  const handleTimesync = () => {
+    droneConnection.sendTimesync();
+    addLog('Zeitsynchronisation gesendet');
   };
 
   const updateDroneModels = (time) => {
@@ -400,7 +427,16 @@ const MultiDroneControl = () => {
   return (
     <div className="min-h-screen bg-gray-900 text-white p-4">
       <div className="max-w-7xl mx-auto">
-        <h1 className="text-2xl font-bold mb-3 text-center">Multi-Drone Mission Planner</h1>
+        <div className="flex items-center justify-between mb-3">
+          <h1 className="text-2xl font-bold">{t('appTitle')}</h1>
+          <button
+            onClick={() => setLang(lang === 'de' ? 'en' : 'de')}
+            className="px-3 py-1 bg-gray-700 hover:bg-gray-600 rounded text-sm font-medium border border-gray-600"
+            title={lang === 'de' ? 'Switch to English' : 'Zu Deutsch wechseln'}
+          >
+            {lang === 'de' ? '🇩🇪 DE' : '🇬🇧 EN'}
+          </button>
+        </div>
 
         {/* Tab Navigation */}
         <div className="flex gap-1 mb-4 border-b border-gray-700">
@@ -408,13 +444,13 @@ const MultiDroneControl = () => {
             onClick={() => setActiveTab('3d')}
             className={`px-4 py-2 rounded-t text-sm font-medium flex items-center gap-2 transition-colors ${activeTab === '3d' ? 'bg-gray-800 text-white border-b-2 border-blue-500' : 'text-gray-400 hover:text-white'}`}
           >
-            <Box className="w-4 h-4" /> 3D Show Planner
+            <Box className="w-4 h-4" /> {t('tab3d')}
           </button>
           <button
             onClick={() => setActiveTab('gps')}
             className={`px-4 py-2 rounded-t text-sm font-medium flex items-center gap-2 transition-colors ${activeTab === 'gps' ? 'bg-gray-800 text-white border-b-2 border-blue-500' : 'text-gray-400 hover:text-white'}`}
           >
-            <Map className="w-4 h-4" /> GPS Karte &amp; Geofence
+            <Map className="w-4 h-4" /> {t('tabGps')}
           </button>
         </div>
 
@@ -442,7 +478,7 @@ const MultiDroneControl = () => {
                 <h2 className="text-lg font-semibold">3D Viewport</h2>
                 <div className="flex gap-2 flex-wrap">
                   <button onClick={handleLoad3DModel} className="bg-cyan-600 hover:bg-cyan-700 px-3 py-1 rounded text-sm flex items-center gap-1">
-                    <Box className="w-4 h-4" /> 3D Modell
+                    <Box className="w-4 h-4" /> {t('model3d')}
                   </button>
                   <select
                     value={interpolationMode}
@@ -452,14 +488,14 @@ const MultiDroneControl = () => {
                     <option value="linear">Linear</option>
                     <option value="smooth">Smooth</option>
                   </select>
-                  <button onClick={() => createFormation('circle')} className="bg-purple-600 hover:bg-purple-700 px-3 py-1 rounded text-sm">Kreis</button>
-                  <button onClick={() => createFormation('line')} className="bg-purple-600 hover:bg-purple-700 px-3 py-1 rounded text-sm">Linie</button>
+                  <button onClick={() => createFormation('circle')} className="bg-purple-600 hover:bg-purple-700 px-3 py-1 rounded text-sm">{t('circle')}</button>
+                  <button onClick={() => createFormation('line')} className="bg-purple-600 hover:bg-purple-700 px-3 py-1 rounded text-sm">{t('line')}</button>
                   <button
                     onClick={setStartKeyframes}
                     className="bg-green-700 hover:bg-green-800 px-3 py-1 rounded text-sm flex items-center gap-1"
-                    title="Alle Drohnen erhalten bei t=0 einen Startpunkt"
+                    title={t('startPositions')}
                   >
-                    <MapPin className="w-3 h-3" /> Startpositionen
+                    <MapPin className="w-3 h-3" /> {t('startPositions')}
                   </button>
                 </div>
               </div>
@@ -539,10 +575,13 @@ const MultiDroneControl = () => {
               startMissionOnDrone={startMissionOnDrone}
               stopMissionOnDrone={stopMissionOnDrone}
               emergencyStopDrone={emergencyStopDrone}
+              softLandDrone={softLandDrone}
               bridgeConnected={bridgeConnected}
               discoverDrones={discoverDrones}
               onAddDrone={addDrone}
               onReorderDrones={reorderDrones}
+              telemetry={telemetry}
+              preflight={preflight}
             />
 
             <MissionExport
@@ -552,6 +591,17 @@ const MultiDroneControl = () => {
               interpolationMode={interpolationMode}
               addLog={addLog}
             />
+
+            <div className="bg-gray-800 rounded-lg p-3">
+              <button
+                onClick={handleTimesync}
+                disabled={!bridgeConnected}
+                className="w-full bg-cyan-700 hover:bg-cyan-800 disabled:bg-gray-700 py-1.5 rounded text-xs flex items-center justify-center gap-1"
+                title="Zeitsynchronisation an alle Drohnen senden"
+              >
+                <RefreshCw className="w-3 h-3" /> Zeitsync
+              </button>
+            </div>
 
             {loadedModel && (
               <ModelControls
@@ -583,6 +633,9 @@ const MultiDroneControl = () => {
         </div>}
 
         <EventLog log={log} />
+        <div className="mt-4">
+          <BlackboxViewer />
+        </div>
       </div>
     </div>
   );

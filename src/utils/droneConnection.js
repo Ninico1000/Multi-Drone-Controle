@@ -14,6 +14,7 @@ class DroneConnection {
     this.onTelemetryCallback = null;
     this.onStatusCallback = null;
     this.onDroneListCallback = null;
+    this._seq = 0;
   }
 
   connect(onTelemetry, onStatus, onDroneList) {
@@ -40,13 +41,18 @@ class DroneConnection {
 
           if (message.type === 'telemetry' && this.onTelemetryCallback) {
             this.onTelemetryCallback(message.droneIP, message.data);
+          } else if (message.type === 'lora_rx' && this.onTelemetryCallback) {
+            const data = message.data;
+            if (data && data.id != null) {
+              this.onTelemetryCallback(null, data, data.id);
+            }
+          } else if (message.type === 'preflight' && this.onStatusCallback) {
+            this.onStatusCallback({ type: 'preflight', ...message });
           } else if (message.type === 'drone_list' && this.onDroneListCallback) {
             this.onDroneListCallback(message.drones);
           } else if (message.type === 'drone_connected' && this.onDroneListCallback) {
-            // Trigger list refresh
             this.discoverDrones();
           } else if (message.type === 'drone_disconnected' && this.onDroneListCallback) {
-            // Trigger list refresh
             this.discoverDrones();
           } else if (message.type === 'connected' || message.type === 'ap_connected' || message.type === 'ap_disconnected') {
             this.apConnected = message.apConnected || message.type === 'ap_connected';
@@ -68,7 +74,6 @@ class DroneConnection {
           this.onStatusCallback({ connected: false, message: 'Bridge disconnected' });
         }
 
-        // Attempt reconnection
         if (this.reconnectAttempts < this.maxReconnectAttempts) {
           this.reconnectAttempts++;
           console.log(`Reconnecting... (${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
@@ -92,84 +97,71 @@ class DroneConnection {
 
   disconnect() {
     if (this.ws) {
-      this.reconnectAttempts = this.maxReconnectAttempts; // Prevent auto-reconnect
+      this.reconnectAttempts = this.maxReconnectAttempts;
       this.ws.close();
       this.ws = null;
       this.isConnected = false;
     }
   }
 
-  /**
-   * Discover drones connected to the Access Point
-   */
   discoverDrones() {
     if (!this.isConnected || !this.ws) {
       console.error('Not connected to bridge server');
       return Promise.reject(new Error('Not connected to bridge server'));
     }
-
     return this.send(null, null, { command: 'discover' });
   }
 
   /**
    * Send mission keyframes to drone
-   * @param {string} droneIP - IP address of the drone
-   * @param {Array} keyframes - Array of keyframe objects
    */
   sendMission(droneIP, keyframes) {
     if (!this.isConnected || !this.ws) {
-      console.error('Not connected to bridge server');
       return Promise.reject(new Error('Not connected to bridge server'));
     }
 
-    // Format keyframes for ESP32 (match expected JSON format)
     const missionData = keyframes.map(kf => ({
       t: kf.time,
       x: kf.x,
       y: kf.y,
       z: kf.z,
-      yaw: kf.yaw,
-      pitch: kf.pitch,
-      roll: kf.roll
     }));
 
     const payload = {
       cmd: 'mission',
-      data: missionData
+      seq: ++this._seq,
+      data: missionData,
     };
 
     return this.send(droneIP, payload);
   }
 
-  /**
-   * Start mission on drone
-   * @param {string} droneIP - IP address of the drone
-   */
   startMission(droneIP) {
-    return this.send(droneIP, { cmd: 'start' });
+    return this.send(droneIP, { cmd: 'start', seq: ++this._seq });
   }
 
-  /**
-   * Stop mission on drone
-   * @param {string} droneIP - IP address of the drone
-   */
   stopMission(droneIP) {
-    return this.send(droneIP, { cmd: 'stop' });
+    return this.send(droneIP, { cmd: 'stop', seq: ++this._seq });
   }
 
-  /**
-   * Emergency stop
-   * @param {string} droneIP - IP address of the drone
-   */
   emergencyStop(droneIP) {
-    return this.send(droneIP, { cmd: 'emergency' });
+    return this.send(droneIP, { cmd: 'emergency', seq: ++this._seq });
+  }
+
+  softLand(droneIP) {
+    return this.send(droneIP, { cmd: 'land', seq: ++this._seq });
+  }
+
+  sendTimesync() {
+    return this.send(null, null, { cmd: 'timesync' });
+  }
+
+  startMissionAt(droneIP, droneId, groundMs) {
+    return this.send(droneIP, { to: droneId, cmd: 'start', at: groundMs, seq: ++this._seq });
   }
 
   /**
    * Send command to drone via bridge
-   * @param {string} droneIP - IP address of the drone (null for broadcast/discovery)
-   * @param {Object} payload - Command payload
-   * @param {Object} directCommand - Direct command to bridge (for discovery, etc.)
    */
   send(droneIP, payload, directCommand = null) {
     if (!this.isConnected || !this.ws) {
@@ -179,7 +171,7 @@ class DroneConnection {
     return new Promise((resolve, reject) => {
       const message = directCommand || {
         droneIP,
-        payload
+        payload,
       };
 
       try {
@@ -192,5 +184,4 @@ class DroneConnection {
   }
 }
 
-// Export singleton instance
 export default new DroneConnection();

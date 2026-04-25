@@ -10,8 +10,6 @@ export const INITIAL_DRONES = [
     y: 0,
     z: 0,
     yaw: 0,
-    pitch: 0,
-    roll: 0,
     targetReached: false
   },
   {
@@ -25,8 +23,6 @@ export const INITIAL_DRONES = [
     y: 0,
     z: 0,
     yaw: 0,
-    pitch: 0,
-    roll: 0,
     targetReached: false
   },
   {
@@ -40,8 +36,6 @@ export const INITIAL_DRONES = [
     y: 0,
     z: 0,
     yaw: 0,
-    pitch: 0,
-    roll: 0,
     targetReached: false
   },
 ];

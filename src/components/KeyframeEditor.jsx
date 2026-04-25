@@ -1,7 +1,10 @@
 import React from 'react';
 import { Trash2 } from 'lucide-react';
+import { useLanguage } from '../i18n';
 
 const KeyframeEditor = ({ keyframes, drones, selectedKeyframe, updateKeyframe, deleteKeyframe }) => {
+  const { t } = useLanguage();
+
   const handleColorChange = (kfId, hex) => {
     const h = hex.replace('#', '');
     updateKeyframe(kfId, 'r', parseInt(h.slice(0, 2), 16));
@@ -16,7 +19,7 @@ const KeyframeEditor = ({ keyframes, drones, selectedKeyframe, updateKeyframe, d
 
   return (
     <div className="bg-gray-800 rounded-lg p-4">
-      <h2 className="text-xl font-semibold mb-4">Keyframes</h2>
+      <h2 className="text-xl font-semibold mb-4">{t('keyframes')}</h2>
       <div className="max-h-96 overflow-y-auto space-y-2">
         {keyframes.sort((a, b) => a.time - b.time).map(kf => {
           const drone = drones.find(d => d.id === kf.droneId);
@@ -33,45 +36,54 @@ const KeyframeEditor = ({ keyframes, drones, selectedKeyframe, updateKeyframe, d
               </div>
               <div className="grid grid-cols-2 gap-1">
                 {[
-                  ['Zeit', 'time', 0.1],
+                  [t('time'), 'time', 0.1],
                   ['X', 'x', 0.1],
                   ['Y', 'y', 0.1],
-                  ['Z', 'z', 0.1],
-                  ['Yaw', 'yaw', 1],
-                  ['Pitch', 'pitch', 1],
+                  [t('height'), 'z', 0.1],
                 ].map(([label, field, step]) => (
                   <div key={field} className="flex flex-col">
                     <span className="text-gray-400 text-xs mb-0.5">{label}</span>
-                    <input
-                      type="number"
-                      value={kf[field]}
+                    <input type="number" value={kf[field]}
                       onChange={e => updateKeyframe(kf.id, field, e.target.value)}
-                      className="bg-gray-600 rounded px-1 py-0.5"
-                      step={step}
-                    />
+                      className="bg-gray-600 rounded px-1 py-0.5" step={step} />
                   </div>
                 ))}
               </div>
 
-              {/* RGB LED color */}
               <div className="mt-2 flex items-center gap-2">
-                <span className="text-gray-400">LED:</span>
-                <input
-                  type="color"
-                  value={toHex(r, g, b)}
+                <span className="text-gray-400">{t('led')}:</span>
+                <input type="color" value={toHex(r, g, b)}
                   onChange={e => handleColorChange(kf.id, e.target.value)}
-                  className="w-8 h-6 rounded cursor-pointer border-0 bg-transparent"
-                  title="LED RGB Farbe"
-                />
-                <span className="text-gray-400 font-mono">
+                  className="w-8 h-6 rounded cursor-pointer border-0 bg-transparent" />
+                <span className="text-gray-400 font-mono text-xs">
                   {Math.round(r)},{Math.round(g)},{Math.round(b)}
                 </span>
+              </div>
+              <div className="mt-1.5 flex items-center gap-2">
+                <span className="text-gray-400 text-xs">{t('colorFunction')}:</span>
+                <select value={kf.colorFn ?? 0}
+                  onChange={e => updateKeyframe(kf.id, 'colorFn', parseInt(e.target.value))}
+                  className="bg-gray-600 rounded px-1 py-0.5 text-xs">
+                  <option value={0}>{t('fnSolid')}</option>
+                  <option value={1}>{t('fnPulse')}</option>
+                  <option value={2}>{t('fnStrobe')}</option>
+                </select>
+                {(kf.colorFn ?? 0) > 0 && (
+                  <div className="flex items-center gap-1">
+                    <span className="text-gray-400 text-xs">
+                      {(kf.colorFn ?? 0) === 1 ? t('periodMs') : t('intervalMs')}:
+                    </span>
+                    <input type="number" value={kf.colorFp ?? 1000}
+                      onChange={e => updateKeyframe(kf.id, 'colorFp', parseInt(e.target.value))}
+                      className="bg-gray-600 rounded px-1 py-0.5 w-16 text-xs" min={50} step={50} />
+                  </div>
+                )}
               </div>
             </div>
           );
         })}
         {keyframes.length === 0 && (
-          <div className="text-gray-500 text-xs text-center py-4">Keine Keyframes</div>
+          <div className="text-gray-500 text-xs text-center py-4">{t('noKeyframes')}</div>
         )}
       </div>
     </div>

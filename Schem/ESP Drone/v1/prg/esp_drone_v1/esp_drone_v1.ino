@@ -3,6 +3,7 @@
  * ============================================================
  * MCU   : ESP32-S2-WROVER
  * IMU   : MPU-6050     (I2C bus 0, SDA=IO5, SCL=IO6)
+ * Baro  : BMP280       (I2C bus 0, shared with MPU-6050)
  * Radio : SX1262 LoRa  (SPI HSPI, NSS=IO39, RST=IO21, BUSY=IO38, DIO1=IO37)
  * GPS   : GEPRC M10 FPV (UART1 RX=IO3 ← GPS-TX, TX=IO4 → GPS-RX, 38400 Bd)
  * ESCs  : IO15–IO18    (50 Hz PWM, 1000–2000 µs)
@@ -10,24 +11,32 @@
  * SD    : SPI FSPI     (CMD=IO11, CLK=IO12, DAT0=IO13, CS=IO14)
  *
  * Required libraries (Arduino Library Manager):
- *   RadioLib, MPU6050_light, TinyGPSPlus, Adafruit NeoPixel, ArduinoJson
+ *   RadioLib, MPU6050_light, TinyGPSPlus, Adafruit NeoPixel, ArduinoJson,
+ *   Adafruit BMP280, Adafruit Unified Sensor
  *
- * Board: ESP32S2 Dev Module (Espressif esp32 package ≥ 3.x)
+ * Board: ESP32S2 Dev Module (Espressif esp32 package >= 3.x)
  *
  * SD-Card files:
- *   /config.txt   — id=<1–255>  gps_baud=<38400>
+ *   /config.txt   — id=<1-255>  gps_baud=<38400>
  *   /mission.json — exported from Multi-Drone-Control (MissionExport)
+ *   /bb_<id>.csv  — blackbox log (written each armed session)
  *
- * LoRa protocol — JSON text packets (≤ 200 bytes):
+ * LoRa protocol — JSON text packets (<= 200 bytes):
  *   RX commands : {"cmd":"ping"}
  *                 {"cmd":"start"}
  *                 {"cmd":"stop"}
- *                 {"cmd":"emergency"}
+ *                 {"cmd":"land"}       — soft landing (controlled descent)
+ *                 {"cmd":"emergency"}  — hard cutoff (immediate motor stop)
  *                 {"cmd":"arm","thr":500,"r":0,"p":0,"y":0,"mode":1}
- *                 {"cmd":"reload"}   — re-read mission.json from SD
+ *                 {"cmd":"reload"}     — re-parse mission from RAM cache
  *   TX telemetry: {"id":1,"r":0.1,"p":-0.2,"y":3.1,
  *                  "lat":48.1234,"lng":11.4567,"alt":502.1,
+ *                  "agl":2.3,"pres":1013.2,"temp":22.1,
  *                  "arm":1,"mode":2,"wp":12,"bat":0}
+ *
+ * Waypoint JSON format (no angle fields):
+ *   {"time":0,"x":0,"y":0,"z":2,"r":0,"g":200,"b":255,"fn":0,"fp":0}
+ *   fn: 0=solid  1=pulse (fp=period ms)  2=strobe (fp=blink interval ms)
  */
 
 #include <Arduino.h>
@@ -38,18 +47,21 @@
 #include <RadioLib.h>
 #include <MPU6050_light.h>
 #include <TinyGPSPlus.h>
+#include <Adafruit_BMP280.h>
 #include <SD.h>
 #include <ArduinoJson.h>
 
 // ============================================================
-// Pin Definitions  (from KiCad PCB netlist)
+// Pin Definitions
 // ============================================================
 
 #define PIN_SDA_MPU     5
 #define PIN_SCL_MPU     6
 
-#define PIN_GPS_RX      3    // UART1 RX ← GEPRC M10 TX
-#define PIN_GPS_TX      4    // UART1 TX → GEPRC M10 RX
+#define PIN_GPS_RX      3    // UART1 RX <- GEPRC M10 TX
+#define PIN_GPS_TX      4    // UART1 TX -> GEPRC M10 RX
+#define PIN_GPS_SDA     1    // I2C1 SDA — GPS module (reserved, UART active)
+#define PIN_GPS_SCL     2    // I2C1 SCL — GPS module (reserved, UART active)
 
 #define PIN_ESC1        18   // Motor 1 Front-Left  (CW)
 #define PIN_ESC2        17   // Motor 2 Front-Right (CCW)
@@ -78,13 +90,16 @@
 // Configuration
 // ============================================================
 
-#define GPS_BAUD_DEFAULT    38400    // GEPRC M10 FPV default
+#define GPS_BAUD_DEFAULT    38400
+
+// BMP280 — I2C Bus 0 (shares bus with MPU-6050)
+#define BMP280_I2C_ADDR     0x76    // SDO->GND = 0x76, SDO->VCC = 0x77
 
 #define LORA_FREQUENCY      868.0f
 #define LORA_BANDWIDTH      125.0f
 #define LORA_SPREADING      7
 #define LORA_CODING_RATE    5
-#define LORA_SYNC_WORD      0xAB    // fleet-wide
+#define LORA_SYNC_WORD      0xAB
 #define LORA_TX_POWER       14
 
 #define ESC_PWM_FREQ        50
@@ -106,26 +121,54 @@
 #define PID_YAW_KI      0.05f
 #define PID_YAW_KD      0.0f
 
-// Position P gains (m → degrees attitude setpoint)
-#define POS_P_HORIZ     0.6f   // deg per metre of horizontal error
-#define POS_P_VERT      8.0f   // throttle-units per metre of altitude error
-#define BASE_HOVER_THR  500    // baseline throttle (0–1000) for hover
+// Position P gains
+#define POS_P_HORIZ     0.6f
+#define POS_P_VERT      8.0f
+#define BASE_HOVER_THR  500
 
-#define MAX_WAYPOINTS          400     // fits ~200 s @ 0.5 s intervals
-#define GEOFENCE_WARN_M        10.0f   // approach warn inside this margin
-#define GEOFENCE_BREACH_MS     90000UL // 1 min 30 s → hard disarm
-#define RTH_HOME_RADIUS_M      1.5f    // within this → landed, disarm
-#define RTH_DESCENT_RATE       0.3f    // m/s descent near home
+#define MAX_WAYPOINTS          400
+#define MISSION_BUF_SIZE       25600  // max raw JSON size in RAM
+#define GEOFENCE_BREACH_MS     90000UL
+#define RTH_HOME_RADIUS_M      1.5f
+#define RTH_DESCENT_RATE       0.3f
+
+// Soft landing
+#define LAND_DESCENT_RATE      0.4f   // m/s
+#define LAND_DISARM_AGL        0.15f  // m AGL -> disarm
+
+// Flight modes
+#define MODE_DISARMED   0
+#define MODE_STABILIZE  1
+#define MODE_MISSION    2
+#define MODE_RTH        3
+#define MODE_LAND       4
+
+// LED color functions
+#define COLOR_FN_SOLID    0
+#define COLOR_FN_PULSE    1
+#define COLOR_FN_STROBE   2
+
+// LoRa addressing + TDMA
+// Commands from ground must contain "to": drone_id (or 0 = broadcast)
+// Telemetry slots: each drone waits (drone_id-1)*TELEM_SLOT_MS within the 200ms cycle
+// → up to 4 drones gap-free at 50 ms slots; adjust TELEM_SLOT_MS for larger fleets
+#define TELEM_PERIOD_MS    200   // telemetry cycle
+#define TELEM_SLOT_MS      50    // per-drone slot width
+
+// Blackbox
+#define BB_RECORDS      400   // ring buffer entries in RAM (~14 KB)
+#define BB_FLUSH_MS     2000  // flush to SD every 2 s while armed
 
 // ============================================================
-// Waypoint — mirrors MissionExport.jsx output exactly
+// Waypoint — no angle fields; altitude from barometer
 // ============================================================
 
 struct Waypoint {
-    float time;                  // seconds from mission start
-    float x, y, z;              // metres  East / North / Up  (local ENU)
-    float yaw, pitch, roll;     // degrees
-    uint8_t r, g, b;            // LED colour
+    float    time;
+    float    x, y, z;        // metres ENU relative to homePoint
+    uint8_t  r, g, b;        // LED colour
+    uint8_t  color_fn;       // COLOR_FN_*
+    uint16_t color_fp;       // fn parameter (pulse: period ms, strobe: interval ms)
 };
 
 // ============================================================
@@ -153,6 +196,20 @@ static void pidReset(PID &pid) {
 }
 
 // ============================================================
+// Blackbox record
+// ============================================================
+
+struct BBRecord {
+    uint32_t t_ms;
+    float    roll, pitch, yaw_r;
+    float    agl;
+    float    pres;
+    uint16_t m1, m2, m3, m4;
+    uint8_t  mode;
+    uint16_t wp;
+};
+
+// ============================================================
 // Global Objects
 // ============================================================
 
@@ -160,6 +217,7 @@ Adafruit_NeoPixel leds(NUM_LEDS, PIN_LED, NEO_GRB + NEO_KHZ800);
 
 TwoWire         imuWire(0);
 MPU6050         mpu(imuWire);
+Adafruit_BMP280 bmp(&imuWire);
 
 TinyGPSPlus     gps;
 HardwareSerial  gpsSerial(1);
@@ -176,73 +234,96 @@ PID pid_yaw   = { PID_YAW_KP,   PID_YAW_KI,   PID_YAW_KD,   0, 0 };
 // State
 // ============================================================
 
-uint8_t  drone_id      = 1;
-uint32_t gps_baud      = GPS_BAUD_DEFAULT;
+uint8_t  drone_id  = 1;
+uint32_t gps_baud  = GPS_BAUD_DEFAULT;
 
-// Flight modes: 0=disarmed 1=stabilize 2=mission 3=return
-uint8_t  flight_mode   = 0;
-bool     armed         = false;
+uint8_t  flight_mode = MODE_DISARMED;
+bool     armed       = false;
 
-// Manual setpoints (mode 1)
 float    sp_roll = 0, sp_pitch = 0, sp_yaw = 0;
 int      sp_throttle = 0;
 
-// IMU
 float    imu_roll = 0, imu_pitch = 0, imu_yaw_rate = 0;
 
-// Motor pulse widths
 uint16_t m1 = ESC_PULSE_ARM, m2 = ESC_PULSE_ARM,
          m3 = ESC_PULSE_ARM, m4 = ESC_PULSE_ARM;
 
-// LoRa RX flag (set in ISR)
 volatile bool lora_rx_flag = false;
 
-// Timing
 unsigned long last_loop_us  = 0;
 unsigned long last_telem_ms = 0;
 unsigned long last_led_ms   = 0;
 
-// ──────────────── Mission state ─────────────────────────────
+// LoRa addressing / TDMA
+int8_t  last_rssi    = 0;
+uint8_t last_seq     = 0;    // last received sequence number
 
-Waypoint waypoints[MAX_WAYPOINTS];
-int      wp_count       = 0;
-bool     mission_loaded = false;
+// ── Barometer ────────────────────────────────────────────────
+bool          baro_ok       = false;
+float         baro_pressure = 0.0f;   // hPa
+float         baro_temp     = 0.0f;   // degC
+float         baro_alt      = 0.0f;   // m ASL (sea level ref)
+float         baro_home_alt = 0.0f;   // ASL at arm -> AGL = baro_alt - baro_home_alt
+unsigned long last_baro_ms  = 0;
 
-// GPS home / emergency / geofence from mission JSON
+// ── Mission — raw JSON stays in RAM after first SD read ──────
+static char  mission_buf[MISSION_BUF_SIZE];
+bool         mission_buf_valid = false;
+
+Waypoint     waypoints[MAX_WAYPOINTS];
+int          wp_count       = 0;
+bool         mission_loaded = false;
+
 double   home_lat = 0, home_lng = 0;
 double   emg_lat  = 0, emg_lng  = 0;
 bool     has_home = false, has_emg = false;
-float    geofence_radius = 0;        // 0 = disabled
+float    geofence_radius = 0;
 double   geofence_lat = 0, geofence_lng = 0;
 
-// Mission playback
 bool          mission_running  = false;
 unsigned long mission_start_ms = 0;
 
-// Geofence / Return-to-Home state
-bool          geo_breached      = false;  // currently outside fence
-unsigned long geo_breach_ms     = 0;      // millis() when breach started
-float         rth_return_alt    = 0.0f;   // altitude to maintain during RTH
+int32_t       sync_offset      = 0;    // ground_ms - local_ms
+bool          mission_armed    = false;
+uint32_t      sched_start_ms   = 0;    // local millis to start mission
 
-// Current LED mission colour
-uint8_t led_r = 255, led_g = 255, led_b = 255;
+bool          geo_breached   = false;
+unsigned long geo_breach_ms  = 0;
+float         rth_return_alt = 0.0f;
+
+// Soft landing state
+float         land_start_agl = 0.0f;
+unsigned long land_start_ms  = 0;
+
+// Current LED mission colour + function
+uint8_t  led_r = 255, led_g = 255, led_b = 255;
+uint8_t  led_fn = COLOR_FN_SOLID;
+uint16_t led_fp = 0;
+
+// ── Blackbox ─────────────────────────────────────────────────
+BBRecord      bb_buf[BB_RECORDS];
+uint16_t      bb_head          = 0;
+uint16_t      bb_tail          = 0;
+uint16_t      bb_count         = 0;
+bool          bb_active        = false;
+unsigned long bb_last_flush_ms = 0;
+unsigned long bb_last_rec_ms   = 0;
+File          bb_file;
 
 // ============================================================
-// GPS Utility — flat-earth ENU conversion
+// GPS Utility — flat-earth ENU
 // ============================================================
 
-// Convert GPS (lat, lng) to local ENU metres relative to origin
 static void gpsToENU(double lat, double lng,
                      double orig_lat, double orig_lng,
                      float &east, float &north) {
-    const float R = 6371000.0f;  // Earth radius m
+    const float R = 6371000.0f;
     float dlat = (float)((lat  - orig_lat)  * DEG_TO_RAD);
     float dlng = (float)((lng  - orig_lng)  * DEG_TO_RAD);
     north = dlat * R;
     east  = dlng * R * cosf((float)(orig_lat * DEG_TO_RAD));
 }
 
-// Haversine distance between two GPS coords (metres)
 static float gpsDist(double lat1, double lng1, double lat2, double lng2) {
     const float R = 6371000.0f;
     float dlat = (float)((lat2 - lat1) * DEG_TO_RAD);
@@ -257,7 +338,6 @@ static float gpsDist(double lat1, double lng1, double lat2, double lng2) {
 // Waypoint Interpolation
 // ============================================================
 
-// Smooth-step (same as MissionExport / interpolation.js "smooth")
 static float smoothStep(float t) {
     return t * t * (3.0f - 2.0f * t);
 }
@@ -267,32 +347,29 @@ static Waypoint interpolateWaypoints(float t) {
     if (t <= waypoints[0].time) return waypoints[0];
     if (t >= waypoints[wp_count - 1].time) return waypoints[wp_count - 1];
 
-    // Find bracketing pair
     int i = 0;
-    for (; i < wp_count - 1; i++) {
+    for (; i < wp_count - 1; i++)
         if (waypoints[i].time <= t && waypoints[i + 1].time >= t) break;
-    }
 
-    float dt = waypoints[i + 1].time - waypoints[i].time;
+    float dt    = waypoints[i + 1].time - waypoints[i].time;
     float alpha = (dt > 0.0f) ? (t - waypoints[i].time) / dt : 0.0f;
     alpha = smoothStep(constrain(alpha, 0.0f, 1.0f));
 
     Waypoint out;
-    out.time  = t;
-    out.x     = waypoints[i].x   + (waypoints[i+1].x   - waypoints[i].x)   * alpha;
-    out.y     = waypoints[i].y   + (waypoints[i+1].y   - waypoints[i].y)   * alpha;
-    out.z     = waypoints[i].z   + (waypoints[i+1].z   - waypoints[i].z)   * alpha;
-    out.yaw   = waypoints[i].yaw + (waypoints[i+1].yaw - waypoints[i].yaw) * alpha;
-    out.pitch = waypoints[i].pitch+(waypoints[i+1].pitch-waypoints[i].pitch)*alpha;
-    out.roll  = waypoints[i].roll +(waypoints[i+1].roll -waypoints[i].roll) *alpha;
-    out.r     = (uint8_t)(waypoints[i].r + (waypoints[i+1].r - waypoints[i].r) * alpha);
-    out.g     = (uint8_t)(waypoints[i].g + (waypoints[i+1].g - waypoints[i].g) * alpha);
-    out.b     = (uint8_t)(waypoints[i].b + (waypoints[i+1].b - waypoints[i].b) * alpha);
+    out.time     = t;
+    out.x        = waypoints[i].x + (waypoints[i+1].x - waypoints[i].x) * alpha;
+    out.y        = waypoints[i].y + (waypoints[i+1].y - waypoints[i].y) * alpha;
+    out.z        = waypoints[i].z + (waypoints[i+1].z - waypoints[i].z) * alpha;
+    out.r        = (uint8_t)(waypoints[i].r + (waypoints[i+1].r - waypoints[i].r) * alpha);
+    out.g        = (uint8_t)(waypoints[i].g + (waypoints[i+1].g - waypoints[i].g) * alpha);
+    out.b        = (uint8_t)(waypoints[i].b + (waypoints[i+1].b - waypoints[i].b) * alpha);
+    out.color_fn = waypoints[i+1].color_fn;
+    out.color_fp = waypoints[i+1].color_fp;
     return out;
 }
 
 // ============================================================
-// SD Card
+// SD Card — mission loaded into RAM once, re-parsed on reload
 // ============================================================
 
 static void loadConfig() {
@@ -301,31 +378,22 @@ static void loadConfig() {
     while (f.available()) {
         String line = f.readStringUntil('\n');
         line.trim();
-        if (line.startsWith("id="))       drone_id  = (uint8_t)line.substring(3).toInt();
-        if (line.startsWith("gps_baud=")) gps_baud  = (uint32_t)line.substring(9).toInt();
+        if (line.startsWith("id="))       drone_id = (uint8_t)line.substring(3).toInt();
+        if (line.startsWith("gps_baud=")) gps_baud = (uint32_t)line.substring(9).toInt();
     }
     f.close();
     Serial.printf("[SD] id=%d  gps_baud=%d\n", drone_id, gps_baud);
 }
 
-// Parse the JSON exported by MissionExport.jsx
-// Format: { version, drone, mission:{homePoint,emergencyPoint,geofence,...},
-//           waypoints:[{time,x,y,z,yaw,pitch,roll,r,g,b},...] }
-static bool loadMission() {
-    File f = SD.open("/mission.json");
-    if (!f) { Serial.println("[SD] /mission.json not found"); return false; }
-
-    // Stream-parse to save heap; document size ~24 KB handles ~300 waypoints
+// Parse waypoints from mission_buf[] (already in RAM — no SD access)
+static bool parseMissionFromBuf() {
     DynamicJsonDocument doc(24576);
-    DeserializationError err = deserializeJson(doc, f);
-    f.close();
-
+    DeserializationError err = deserializeJson(doc, mission_buf);
     if (err) {
         Serial.printf("[SD] JSON parse error: %s\n", err.c_str());
         return false;
     }
 
-    // Home point
     has_home = false;
     JsonVariant hp = doc["mission"]["homePoint"];
     if (!hp.isNull()) {
@@ -334,7 +402,6 @@ static bool loadMission() {
         has_home = true;
     }
 
-    // Emergency point
     has_emg = false;
     JsonVariant ep = doc["mission"]["emergencyPoint"];
     if (!ep.isNull()) {
@@ -343,7 +410,6 @@ static bool loadMission() {
         has_emg = true;
     }
 
-    // Geofence
     geofence_radius = 0;
     JsonVariant gf = doc["mission"]["geofence"];
     if (!gf.isNull()) {
@@ -352,29 +418,129 @@ static bool loadMission() {
         geofence_radius = gf["radius"].as<float>();
     }
 
-    // Waypoints
     JsonArray wpa = doc["waypoints"].as<JsonArray>();
     wp_count = 0;
     for (JsonObject wp : wpa) {
         if (wp_count >= MAX_WAYPOINTS) break;
         Waypoint &w  = waypoints[wp_count++];
-        w.time  = wp["time"]  | 0.0f;
-        w.x     = wp["x"]     | 0.0f;
-        w.y     = wp["y"]     | 0.0f;
-        w.z     = wp["z"]     | 0.0f;
-        w.yaw   = wp["yaw"]   | 0.0f;
-        w.pitch = wp["pitch"] | 0.0f;
-        w.roll  = wp["roll"]  | 0.0f;
-        w.r     = wp["r"]     | 255;
-        w.g     = wp["g"]     | 255;
-        w.b     = wp["b"]     | 255;
+        w.time     = wp["time"]  | 0.0f;
+        w.x        = wp["x"]     | 0.0f;
+        w.y        = wp["y"]     | 0.0f;
+        w.z        = wp["z"]     | 0.0f;
+        w.r        = wp["r"]     | 255;
+        w.g        = wp["g"]     | 255;
+        w.b        = wp["b"]     | 255;
+        w.color_fn = wp["fn"]    | (uint8_t)COLOR_FN_SOLID;
+        w.color_fp = wp["fp"]    | (uint16_t)0;
     }
 
-    Serial.printf("[SD] Mission loaded: %d waypoints, home=%s, geofence=%.0fm\n",
-                  wp_count,
-                  has_home ? "yes" : "no",
-                  geofence_radius);
+    Serial.printf("[SD] Mission: %d waypoints, home=%s, geofence=%.0fm\n",
+                  wp_count, has_home ? "yes" : "no", geofence_radius);
     return wp_count > 0;
+}
+
+// Read /mission.json into RAM buffer, then parse
+static bool loadMission() {
+    File f = SD.open("/mission.json");
+    if (!f) { Serial.println("[SD] /mission.json not found"); return false; }
+
+    size_t len = f.size();
+    if (len >= MISSION_BUF_SIZE) {
+        Serial.printf("[SD] mission.json too large (%u B, max %u B)\n",
+                      len, MISSION_BUF_SIZE - 1);
+        f.close();
+        return false;
+    }
+
+    size_t n = f.readBytes(mission_buf, len);
+    f.close();
+    mission_buf[n] = '\0';
+    mission_buf_valid = (n == len);
+
+    Serial.printf("[SD] mission.json -> RAM (%u B)\n", n);
+    return parseMissionFromBuf();
+}
+
+// ============================================================
+// Blackbox
+// ============================================================
+
+static void bbOpen() {
+    char path[24];
+    snprintf(path, sizeof(path), "/bb_%d.csv", drone_id);
+    bb_file = SD.open(path, FILE_WRITE);
+    if (!bb_file) { Serial.println("[BB] Failed to open blackbox file"); return; }
+    bb_file.println("t_ms,roll,pitch,yaw_r,agl,pres,m1,m2,m3,m4,mode,wp");
+    bb_active        = true;
+    bb_head          = 0;
+    bb_tail          = 0;
+    bb_count         = 0;
+    bb_last_flush_ms = millis();
+    Serial.printf("[BB] Open: %s\n", path);
+}
+
+static void bbFlush() {
+    if (!bb_active || bb_count == 0) return;
+    uint16_t n = bb_count;
+    while (n-- > 0) {
+        const BBRecord &r = bb_buf[bb_tail];
+        bb_file.printf("%lu,%.2f,%.2f,%.2f,%.2f,%.1f,%u,%u,%u,%u,%u,%u\n",
+                       r.t_ms, r.roll, r.pitch, r.yaw_r,
+                       r.agl, r.pres,
+                       r.m1, r.m2, r.m3, r.m4,
+                       r.mode, r.wp);
+        bb_tail = (bb_tail + 1) % BB_RECORDS;
+        bb_count--;
+    }
+    bb_file.flush();
+}
+
+static void bbClose() {
+    if (!bb_active) return;
+    bbFlush();
+    bb_file.close();
+    bb_active = false;
+    Serial.println("[BB] Closed");
+}
+
+static void bbRecord(uint16_t wp_idx) {
+    BBRecord &r = bb_buf[bb_head];
+    r.t_ms  = millis();
+    r.roll  = imu_roll;
+    r.pitch = imu_pitch;
+    r.yaw_r = imu_yaw_rate;
+    r.agl   = baro_ok ? (baro_alt - baro_home_alt) : 0.0f;
+    r.pres  = baro_ok ? baro_pressure : 0.0f;
+    r.m1 = m1;  r.m2 = m2;  r.m3 = m3;  r.m4 = m4;
+    r.mode  = flight_mode;
+    r.wp    = wp_idx;
+
+    bb_head = (bb_head + 1) % BB_RECORDS;
+    if (bb_count < BB_RECORDS) {
+        bb_count++;
+    } else {
+        bb_tail = (bb_tail + 1) % BB_RECORDS;  // ring: overwrite oldest
+    }
+}
+
+// ============================================================
+// Arm / Disarm helpers
+// ============================================================
+
+static void armDrone(uint8_t mode) {
+    armed       = true;
+    flight_mode = mode;
+    if (baro_ok) baro_home_alt = baro_alt;
+    bbOpen();
+}
+
+static void disarmDrone() {
+    armed           = false;
+    flight_mode     = MODE_DISARMED;
+    mission_running = false;
+    m1 = m2 = m3 = m4 = ESC_PULSE_ARM;
+    pidReset(pid_roll); pidReset(pid_pitch); pidReset(pid_yaw);
+    bbClose();
 }
 
 // ============================================================
@@ -388,73 +554,151 @@ static void loraSend(const char *json) {
     radio.startReceive();
 }
 
-// Send JSON telemetry to ground station
 static void sendTelemetry(int wp_index) {
-    char buf[200];
+    char buf[240];
     snprintf(buf, sizeof(buf),
         "{\"id\":%d,\"r\":%.1f,\"p\":%.1f,\"y\":%.1f,"
         "\"lat\":%.6f,\"lng\":%.6f,\"alt\":%.1f,"
-        "\"arm\":%d,\"mode\":%d,\"wp\":%d,\"bat\":0}",
+        "\"agl\":%.1f,\"pres\":%.1f,\"temp\":%.1f,"
+        "\"arm\":%d,\"mode\":%d,\"wp\":%d,\"rssi\":%d,\"bat\":0}",
         drone_id,
         imu_roll, imu_pitch, imu_yaw_rate,
         gps.location.isValid() ? gps.location.lat() : 0.0,
         gps.location.isValid() ? gps.location.lng() : 0.0,
         gps.altitude.isValid() ? gps.altitude.meters() : 0.0,
+        baro_ok ? (baro_alt - baro_home_alt) : 0.0f,
+        baro_ok ? baro_pressure : 0.0f,
+        baro_ok ? baro_temp     : 0.0f,
         armed ? 1 : 0,
         flight_mode,
-        wp_index);
+        wp_index,
+        (int)last_rssi);
     loraSend(buf);
 }
 
-// Process incoming LoRa JSON command
 static void processCommand(const char *json, size_t len) {
     StaticJsonDocument<256> doc;
     if (deserializeJson(doc, json, len) != DeserializationError::Ok) return;
 
+    // Addressing: "to" must be our drone_id or 0 (broadcast); absent = broadcast
+    int to = doc["to"] | 0;
+    if (to != 0 && to != (int)drone_id) return;
+
     const char *cmd = doc["cmd"] | "";
+
+    // ACK critical commands immediately (before acting on them)
+    uint8_t seq = doc["seq"] | 0;
+    if (seq != last_seq) {
+        last_seq = seq;
+        const char *ack_cmds[] = { "start", "stop", "land", "emergency", "reload", "timesync" };
+        for (const char *ac : ack_cmds) {
+            if (strcmp(cmd, ac) == 0) {
+                char ack[64];
+                snprintf(ack, sizeof(ack),
+                         "{\"type\":\"ack\",\"id\":%d,\"seq\":%d}", drone_id, seq);
+                loraSend(ack);
+                break;
+            }
+        }
+    }
 
     if (strcmp(cmd, "ping") == 0) {
         char buf[64];
         snprintf(buf, sizeof(buf), "{\"type\":\"pong\",\"id\":%d}", drone_id);
         loraSend(buf);
 
+    } else if (strcmp(cmd, "timesync") == 0) {
+        uint32_t t = doc["t"] | (uint32_t)0;
+        sync_offset = (int32_t)t - (int32_t)millis();
+        char buf[80];
+        snprintf(buf, sizeof(buf),
+                 "{\"type\":\"timesync\",\"id\":%d,\"offset\":%ld}",
+                 drone_id, (long)sync_offset);
+        loraSend(buf);
+
     } else if (strcmp(cmd, "start") == 0) {
-        if (mission_loaded && wp_count > 0) {
-            flight_mode      = 2;  // mission
-            armed            = true;
-            mission_running  = true;
-            mission_start_ms = millis();
-            Serial.println("[CMD] Mission start");
+        // Pre-flight checks
+        char fail_buf[96];
+        int preflight_seq = doc["seq"] | 0;
+        bool pf_ok = true;
+
+        auto pf_fail = [&](const char *reason) {
+            snprintf(fail_buf, sizeof(fail_buf),
+                     "{\"type\":\"preflight\",\"id\":%d,\"seq\":%d,\"ok\":0,\"fail\":\"%s\"}",
+                     drone_id, preflight_seq, reason);
+            loraSend(fail_buf);
+            pf_ok = false;
+        };
+
+        if (!mission_loaded || wp_count == 0)                          { pf_fail("NO_MISSION"); }
+        else if (!baro_ok)                                             { pf_fail("BARO_FAIL"); }
+        else if (!gps.location.isValid())                              { pf_fail("NO_GPS_FIX"); }
+        else if (gps.satellites.isValid() && gps.satellites.value() < 6) { pf_fail("LOW_SATS"); }
+        else if (!has_home)                                            { pf_fail("NO_HOME"); }
+
+        if (!pf_ok) {
+            Serial.printf("[CMD] pre-flight fail: %s\n", fail_buf);
         } else {
-            Serial.println("[CMD] start: no mission loaded");
+            char ok_buf[80];
+            snprintf(ok_buf, sizeof(ok_buf),
+                     "{\"type\":\"preflight\",\"id\":%d,\"seq\":%d,\"ok\":1}",
+                     drone_id, preflight_seq);
+            loraSend(ok_buf);
+
+            uint32_t at_ms = doc["at"] | (uint32_t)0;
+            if (at_ms != 0) {
+                mission_armed    = true;
+                sched_start_ms   = (uint32_t)((int32_t)at_ms - sync_offset);
+                Serial.printf("[CMD] Mission armed, sched @ local ms %u\n", sched_start_ms);
+            } else {
+                armDrone(MODE_MISSION);
+                mission_running  = true;
+                mission_start_ms = millis();
+                Serial.println("[CMD] Mission start (immediate)");
+            }
         }
 
     } else if (strcmp(cmd, "stop") == 0) {
-        mission_running = false;
-        flight_mode     = 0;
-        armed           = false;
+        disarmDrone();
         Serial.println("[CMD] Stop");
 
+    } else if (strcmp(cmd, "land") == 0) {
+        // Soft emergency: controlled descent to ground
+        if (armed && flight_mode != MODE_LAND) {
+            mission_running = false;
+            flight_mode     = MODE_LAND;
+            land_start_agl  = baro_ok ? (baro_alt - baro_home_alt) : 2.0f;
+            land_start_ms   = millis();
+            sp_roll = sp_pitch = sp_yaw = 0.0f;
+            Serial.println("[CMD] Soft land");
+            char buf[64];
+            snprintf(buf, sizeof(buf), "{\"type\":\"land\",\"id\":%d}", drone_id);
+            loraSend(buf);
+        }
+
     } else if (strcmp(cmd, "emergency") == 0) {
-        mission_running = false;
-        flight_mode     = 0;
-        armed           = false;
-        m1 = m2 = m3 = m4 = ESC_PULSE_ARM;
-        pidReset(pid_roll); pidReset(pid_pitch); pidReset(pid_yaw);
-        Serial.println("[CMD] EMERGENCY STOP");
+        // Hard cutoff: immediate motor stop, no controlled descent
+        disarmDrone();
+        Serial.println("[CMD] HARD CUTOFF");
+        char buf[64];
+        snprintf(buf, sizeof(buf), "{\"type\":\"cutoff\",\"id\":%d}", drone_id);
+        loraSend(buf);
 
     } else if (strcmp(cmd, "arm") == 0) {
-        // Manual flight: {"cmd":"arm","thr":500,"r":0,"p":0,"y":0,"mode":1}
         sp_throttle = doc["thr"] | 0;
         sp_roll     = (float)(doc["r"] | 0);
         sp_pitch    = (float)(doc["p"] | 0);
         sp_yaw      = (float)(doc["y"] | 0);
-        flight_mode = doc["mode"] | 1;
-        armed       = true;
-        mission_running = false;
+        armDrone(doc["mode"] | (int)MODE_STABILIZE);
 
     } else if (strcmp(cmd, "reload") == 0) {
-        mission_loaded = loadMission();
+        // Re-parse from RAM — SD not accessed
+        if (mission_buf_valid) {
+            mission_loaded = parseMissionFromBuf();
+            Serial.println("[CMD] Reload from RAM");
+        } else {
+            mission_loaded = loadMission();
+        }
     }
 }
 
@@ -467,9 +711,41 @@ static void ledsSet(uint8_t r, uint8_t g, uint8_t b) {
     leds.show();
 }
 
-// Armed navigation lights: white front, red rear, sides from mission colour
-static void ledsNavigation(uint8_t mr, uint8_t mg, uint8_t mb) {
-    leds.fill(leds.Color(mr, mg, mb));
+// Apply color function to a base colour and return result
+static void evalColorFn(uint8_t br, uint8_t bg, uint8_t bb,
+                        uint8_t fn, uint16_t fp,
+                        uint8_t &or_, uint8_t &og, uint8_t &ob) {
+    switch (fn) {
+        case COLOR_FN_PULSE: {
+            uint16_t period = fp > 0 ? fp : 1000;
+            float phase = (float)(millis() % period) / (float)period;
+            float bright = 0.5f + 0.5f * sinf(phase * 2.0f * (float)M_PI);
+            or_ = (uint8_t)(br * bright);
+            og  = (uint8_t)(bg * bright);
+            ob  = (uint8_t)(bb * bright);
+            break;
+        }
+        case COLOR_FN_STROBE: {
+            uint16_t interval = fp > 0 ? fp : 200;
+            bool on = ((millis() / interval) % 2) == 0;
+            or_ = on ? br : 0;
+            og  = on ? bg : 0;
+            ob  = on ? bb : 0;
+            break;
+        }
+        default:  // COLOR_FN_SOLID
+            or_ = br;  og = bg;  ob = bb;
+            break;
+    }
+}
+
+// Armed navigation lights — nav colours fixed, side LEDs use color fn
+static void ledsNavigation(uint8_t mr, uint8_t mg, uint8_t mb,
+                           uint8_t fn, uint16_t fp) {
+    uint8_t sr, sg, sb;
+    evalColorFn(mr, mg, mb, fn, fp, sr, sg, sb);
+
+    leds.fill(leds.Color(sr, sg, sb));
     leds.setPixelColor(0,  leds.Color(255, 255, 255));  // FL white
     leds.setPixelColor(1,  leds.Color(255, 255, 255));  // FR white
     leds.setPixelColor(14, leds.Color(180, 0,   0));    // RL red
@@ -482,16 +758,18 @@ static void ledsUpdate() {
         // Slow blue pulse = disarmed idle
         uint8_t b = (uint8_t)(128 + 127 * sinf((float)millis() / 500.0f));
         ledsSet(0, 0, b);
-    } else if (flight_mode == 3) {
-        // Return-to-Home: fast orange strobe
+    } else if (flight_mode == MODE_RTH) {
+        // Fast orange strobe = RTH
         bool on = ((millis() / 150) % 2) == 0;
-        ledsNavigation(on ? 255 : 0, on ? 80 : 0, 0);
-    } else if (flight_mode == 2 && mission_running) {
-        // Mission: waypoint colour on sides, nav lights front/rear
-        ledsNavigation(led_r, led_g, led_b);
+        ledsNavigation(on ? 255 : 0, on ? 80 : 0, 0, COLOR_FN_SOLID, 0);
+    } else if (flight_mode == MODE_LAND) {
+        // Slow yellow pulse = landing
+        ledsNavigation(255, 200, 0, COLOR_FN_PULSE, 800);
+    } else if (flight_mode == MODE_MISSION && mission_running) {
+        ledsNavigation(led_r, led_g, led_b, led_fn, led_fp);
     } else {
-        // Manual / stabilize: green sides
-        ledsNavigation(0, 80, 0);
+        // Stabilize / idle: green sides
+        ledsNavigation(0, 80, 0, COLOR_FN_SOLID, 0);
     }
 }
 
@@ -519,13 +797,13 @@ void setup() {
     Serial.begin(115200);
     Serial.println("\n=== ESP Drone v1 Boot ===");
 
-    // LEDs — early status
     leds.begin();
     leds.setBrightness(80);
     ledsSet(255, 128, 0);  // orange = booting
 
-    // IMU
+    // I2C Bus 0: MPU-6050 + BMP280
     imuWire.begin(PIN_SDA_MPU, PIN_SCL_MPU);
+
     uint8_t mpu_err = mpu.begin();
     if (mpu_err != 0) {
         Serial.printf("[IMU] MPU-6050 error %d\n", mpu_err);
@@ -535,7 +813,22 @@ void setup() {
         Serial.println("[IMU] Calibration done");
     }
 
-    // SD card  (FSPI bus: CLK=IO12, MISO=IO13, MOSI=IO11, CS=IO14)
+    baro_ok = bmp.begin(BMP280_I2C_ADDR);
+    if (!baro_ok) {
+        Serial.println("[BARO] BMP280 not found — check address/wiring");
+    } else {
+        bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                        Adafruit_BMP280::SAMPLING_X2,    // temperature
+                        Adafruit_BMP280::SAMPLING_X16,   // pressure
+                        Adafruit_BMP280::FILTER_X16,
+                        Adafruit_BMP280::STANDBY_MS_1);
+        baro_alt      = bmp.readAltitude();
+        baro_home_alt = baro_alt;
+        Serial.printf("[BARO] BMP280 OK  %.1f hPa  %.1f C  alt=%.1f m\n",
+                      bmp.readPressure() / 100.0f, bmp.readTemperature(), baro_alt);
+    }
+
+    // SD card  (FSPI: CLK=IO12, MISO=IO13, MOSI=IO11, CS=IO14)
     SPI.begin(PIN_SD_CLK, PIN_SD_DAT0, PIN_SD_CMD, PIN_SD_CS);
     if (!SD.begin(PIN_SD_CS)) {
         Serial.println("[SD] No card or mount failed");
@@ -545,7 +838,7 @@ void setup() {
         mission_loaded = loadMission();
     }
 
-    // GPS — GEPRC M10 FPV
+    // GPS — GEPRC M10 FPV (UART)
     gpsSerial.begin(gps_baud, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
     Serial.printf("[GPS] GEPRC M10 UART1 @ %d baud\n", gps_baud);
 
@@ -560,7 +853,7 @@ void setup() {
     delay(2000);
     Serial.println("[ESC] Armed");
 
-    // LoRa — SX1262 (HSPI: SCK=IO34, MISO=IO41, MOSI=IO40, NSS=IO39)
+    // LoRa — SX1262
     loraSPI.begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI, PIN_LORA_NSS);
     int lr = radio.begin(LORA_FREQUENCY, LORA_BANDWIDTH,
                          LORA_SPREADING, LORA_CODING_RATE,
@@ -577,9 +870,14 @@ void setup() {
     ledsSet(0, 255, 0);  // green = ready
     delay(500);
 
+    // TDMA: stagger telemetry by drone_id so packets don't collide
+    // Drone 1 transmits at t=0, drone 2 at t=50ms, drone 3 at t=100ms, etc.
+    last_telem_ms = millis() - TELEM_PERIOD_MS + (uint32_t)(drone_id - 1) * TELEM_SLOT_MS;
+
     last_loop_us = micros();
-    Serial.printf("[SYS] Loop %d Hz  —  Drone ID %d  —  %d waypoints loaded\n",
-                  LOOP_RATE_HZ, drone_id, wp_count);
+    Serial.printf("[SYS] Loop %d Hz  —  ID %d  —  %d wp  —  Baro %s  —  TDMA slot %d ms\n",
+                  LOOP_RATE_HZ, drone_id, wp_count, baro_ok ? "OK" : "FAIL",
+                  (drone_id - 1) * TELEM_SLOT_MS);
 }
 
 // ============================================================
@@ -599,15 +897,24 @@ void loop() {
     imu_pitch    = mpu.getAngleY();
     imu_yaw_rate = mpu.getGyroZ();
 
-    // ── 2. GPS — feed NMEA parser ────────────────────────────
+    // ── 2. Barometer — every 50 ms ───────────────────────────
+    if (baro_ok && millis() - last_baro_ms >= 50) {
+        last_baro_ms  = millis();
+        baro_pressure = bmp.readPressure() / 100.0f;
+        baro_temp     = bmp.readTemperature();
+        baro_alt      = bmp.readAltitude();
+    }
+
+    // ── 3. GPS — feed NMEA parser ────────────────────────────
     while (gpsSerial.available()) gps.encode((char)gpsSerial.read());
 
-    // ── 3. LoRa — receive command ────────────────────────────
+    // ── 4. LoRa — receive command ────────────────────────────
     if (lora_rx_flag) {
         lora_rx_flag = false;
         uint8_t buf[220];
         int state = radio.readData(buf, sizeof(buf) - 1);
         if (state == RADIOLIB_ERR_NONE) {
+            last_rssi = (int8_t)radio.getRSSI();
             int rxLen = radio.getPacketLength();
             buf[rxLen] = '\0';
             processCommand((const char *)buf, rxLen);
@@ -615,23 +922,29 @@ void loop() {
         radio.startReceive();
     }
 
-    // ── 4. Geofence check ────────────────────────────────────
+    // ── 5. Scheduled mission start ──────────────────────────
+    if (mission_armed && mission_loaded && wp_count > 0 &&
+        (int32_t)(millis() - sched_start_ms) >= 0) {
+        mission_armed    = false;
+        armDrone(MODE_MISSION);
+        mission_running  = true;
+        mission_start_ms = millis();
+    }
+
+    // ── 6. Geofence ──────────────────────────────────────────
     if (armed && geofence_radius > 0 && gps.location.isValid()) {
         float dist = gpsDist(gps.location.lat(), gps.location.lng(),
                              geofence_lat, geofence_lng);
 
         if (dist > geofence_radius) {
             if (!geo_breached) {
-                // First breach — initiate Return-to-Home
-                geo_breached  = true;
-                geo_breach_ms = millis();
-                rth_return_alt = gps.altitude.isValid()
-                                 ? (float)gps.altitude.meters() : 0.0f;
+                geo_breached   = true;
+                geo_breach_ms  = millis();
+                rth_return_alt = baro_ok ? (baro_alt - baro_home_alt) : 0.0f;
                 mission_running = false;
-                flight_mode     = 3;   // RTH
-                Serial.printf("[GEO] Breach %.0f m > %.0f m — RTH initiated\n",
+                flight_mode     = MODE_RTH;
+                Serial.printf("[GEO] Breach %.0f m > %.0f m — RTH\n",
                               dist, geofence_radius);
-                // Notify ground station
                 char buf[80];
                 snprintf(buf, sizeof(buf),
                          "{\"type\":\"geo\",\"id\":%d,\"dist\":%.0f,\"rth\":1}",
@@ -639,13 +952,9 @@ void loop() {
                 loraSend(buf);
             }
 
-            // Hard disarm after 90 s of continuous breach
             if (millis() - geo_breach_ms >= GEOFENCE_BREACH_MS) {
-                armed       = false;
-                flight_mode = 0;
+                disarmDrone();
                 geo_breached = false;
-                m1 = m2 = m3 = m4 = ESC_PULSE_ARM;
-                pidReset(pid_roll); pidReset(pid_pitch); pidReset(pid_yaw);
                 Serial.println("[GEO] 90 s timeout — HARD DISARM");
                 char buf[64];
                 snprintf(buf, sizeof(buf),
@@ -653,125 +962,125 @@ void loop() {
                 loraSend(buf);
             }
         } else {
-            // Back inside fence — clear breach flag (if RTH succeeded)
-            if (geo_breached && flight_mode == 3) {
-                // Reached home area, will disarm below in RTH block
-            }
+            if (geo_breached && flight_mode == MODE_RTH)
+                geo_breached = false;
         }
     }
 
-    // ── 5. Flight Control ────────────────────────────────────
-    int active_wp = 0;
+    // ── 7. Flight Control ────────────────────────────────────
+    int   active_wp = 0;
+    float cur_agl   = baro_ok ? (baro_alt - baro_home_alt) : 0.0f;
 
     if (armed) {
-        if (flight_mode == 3) {
+
+        if (flight_mode == MODE_LAND) {
+            // ── Soft landing: descend at fixed rate ───────────
+            float elapsed    = (float)(millis() - land_start_ms) / 1000.0f;
+            float target_agl = land_start_agl - LAND_DESCENT_RATE * elapsed;
+            if (target_agl < 0.0f) target_agl = 0.0f;
+
+            sp_roll     = 0.0f;
+            sp_pitch    = 0.0f;
+            sp_yaw      = 0.0f;
+            sp_throttle = BASE_HOVER_THR
+                        + (int)constrain(POS_P_VERT * (target_agl - cur_agl),
+                                         -300.0f, 300.0f);
+
+            if (cur_agl <= LAND_DISARM_AGL) {
+                disarmDrone();
+                Serial.println("[LAND] Touchdown — disarmed");
+                char buf[64];
+                snprintf(buf, sizeof(buf),
+                         "{\"type\":\"land\",\"id\":%d,\"landed\":1}", drone_id);
+                loraSend(buf);
+            }
+
+        } else if (flight_mode == MODE_RTH) {
             // ── Return-to-Home ─────────────────────────────────
-            // Requires homePoint from mission JSON and GPS fix
             if (has_home && gps.location.isValid()) {
                 float cur_east, cur_north;
                 gpsToENU(gps.location.lat(), gps.location.lng(),
-                         home_lat, home_lng,
-                         cur_east, cur_north);
+                         home_lat, home_lng, cur_east, cur_north);
 
-                // Horizontal error to home (home = origin = 0,0)
-                float err_east  = 0.0f - cur_east;
-                float err_north = 0.0f - cur_north;
-                float horiz_dist = sqrtf(err_east * err_east + err_north * err_north);
+                float err_east   = 0.0f - cur_east;
+                float err_north  = 0.0f - cur_north;
+                float horiz_dist = sqrtf(err_east*err_east + err_north*err_north);
 
-                // Altitude: maintain rth_return_alt while flying back,
-                // descend slowly once over home
-                float cur_alt = gps.altitude.isValid()
-                                ? (float)gps.altitude.meters() : rth_return_alt;
-                float target_alt;
-                if (horiz_dist > RTH_HOME_RADIUS_M) {
-                    target_alt = rth_return_alt;  // keep altitude during transit
-                } else {
-                    // Over home — descend at RTH_DESCENT_RATE m/s
-                    float elapsed = (float)(millis() - geo_breach_ms) / 1000.0f;
-                    target_alt = rth_return_alt - RTH_DESCENT_RATE * elapsed;
-                }
-
-                float err_alt = target_alt - cur_alt;
+                float target_alt = (horiz_dist > RTH_HOME_RADIUS_M)
+                    ? rth_return_alt
+                    : rth_return_alt - RTH_DESCENT_RATE
+                      * ((float)(millis() - geo_breach_ms) / 1000.0f);
 
                 sp_roll     = constrain( POS_P_HORIZ * err_east,  -25.0f, 25.0f);
                 sp_pitch    = constrain(-POS_P_HORIZ * err_north, -25.0f, 25.0f);
-                sp_yaw      = 0.0f;  // face north during RTH
+                sp_yaw      = 0.0f;
                 sp_throttle = BASE_HOVER_THR
-                            + (int)constrain(POS_P_VERT * err_alt, -300.0f, 300.0f);
+                            + (int)constrain(POS_P_VERT * (target_alt - cur_agl),
+                                             -300.0f, 300.0f);
 
-                // Landed: horizontally home + low altitude → disarm
-                if (horiz_dist < RTH_HOME_RADIUS_M && cur_alt < (rth_return_alt - 1.0f)) {
-                    armed        = false;
-                    flight_mode  = 0;
+                if (horiz_dist < RTH_HOME_RADIUS_M && cur_agl < (rth_return_alt - 1.0f)) {
+                    disarmDrone();
                     geo_breached = false;
-                    Serial.println("[RTH] Landed at home — disarmed");
+                    Serial.println("[RTH] Landed — disarmed");
                     char buf[64];
                     snprintf(buf, sizeof(buf),
                              "{\"type\":\"rth\",\"id\":%d,\"landed\":1}", drone_id);
                     loraSend(buf);
                 }
             } else {
-                // No GPS or no home — hover in place, wait for fix
                 sp_roll = sp_pitch = sp_yaw = 0.0f;
                 sp_throttle = BASE_HOVER_THR;
             }
-        } else if (flight_mode == 2 && mission_running) {
-            // ── Mission mode: GPS position control ────────────
-            float t = (float)(millis() - mission_start_ms) / 1000.0f;
+
+        } else if (flight_mode == MODE_MISSION && mission_running) {
+            // ── Mission: GPS horizontal + baro vertical ────────
+            float t   = (float)(millis() - mission_start_ms) / 1000.0f;
             float dur = (wp_count > 0) ? waypoints[wp_count - 1].time : 0.0f;
 
             if (t > dur) {
-                // Mission complete → disarm
-                mission_running = false;
-                flight_mode     = 0;
-                armed           = false;
+                disarmDrone();
             } else {
                 Waypoint target = interpolateWaypoints(t);
 
-                for (int i = 0; i < wp_count - 1; i++) {
+                for (int i = 0; i < wp_count - 1; i++)
                     if (waypoints[i].time <= t) active_wp = i;
-                }
 
-                led_r = target.r;
-                led_g = target.g;
-                led_b = target.b;
+                led_r  = target.r;
+                led_g  = target.g;
+                led_b  = target.b;
+                led_fn = target.color_fn;
+                led_fp = target.color_fp;
 
                 if (has_home && gps.location.isValid()) {
                     float cur_east, cur_north;
                     gpsToENU(gps.location.lat(), gps.location.lng(),
-                             home_lat, home_lng,
-                             cur_east, cur_north);
+                             home_lat, home_lng, cur_east, cur_north);
 
-                    float err_east  = target.x - cur_east;
-                    float err_north = target.y - cur_north;
-                    float err_alt   = target.z
-                                    - (float)(gps.altitude.isValid()
-                                              ? gps.altitude.meters() : 0.0);
-
-                    sp_roll  = constrain( POS_P_HORIZ * err_east,  -25.0f, 25.0f);
-                    sp_pitch = constrain(-POS_P_HORIZ * err_north, -25.0f, 25.0f);
-                    sp_yaw   = target.yaw;
+                    sp_roll     = constrain( POS_P_HORIZ * (target.x - cur_east),
+                                            -25.0f, 25.0f);
+                    sp_pitch    = constrain(-POS_P_HORIZ * (target.y - cur_north),
+                                           -25.0f, 25.0f);
+                    sp_yaw      = 0.0f;
                     sp_throttle = BASE_HOVER_THR
-                                + (int)constrain(POS_P_VERT * err_alt, -300.0f, 300.0f);
+                                + (int)constrain(POS_P_VERT * (target.z - cur_agl),
+                                                 -300.0f, 300.0f);
                 } else {
-                    // No GPS fix — hold attitude from waypoint
-                    sp_roll     = target.roll;
-                    sp_pitch    = target.pitch;
-                    sp_yaw      = target.yaw;
-                    sp_throttle = BASE_HOVER_THR;
+                    // No GPS — hover at target altitude from baro only
+                    sp_roll = sp_pitch = sp_yaw = 0.0f;
+                    sp_throttle = BASE_HOVER_THR
+                                + (int)constrain(POS_P_VERT * (target.z - cur_agl),
+                                                 -300.0f, 300.0f);
                 }
             }
         }
-        // (mode 1 = stabilize: sp_* already set by "arm" command)
+        // MODE_STABILIZE: sp_* already set by "arm" command
 
-        // Attitude PID
+        // ── Attitude PID ──────────────────────────────────────
         float out_roll  = pidUpdate(pid_roll,  sp_roll,  imu_roll,     dt);
         float out_pitch = pidUpdate(pid_pitch, sp_pitch, imu_pitch,    dt);
         float out_yaw   = pidUpdate(pid_yaw,   sp_yaw,   imu_yaw_rate, dt);
 
-        // X-frame mixer
-        //   M1(CW) ── M2(CCW)       Front
-        //   M4(CCW)── M3(CW)        Rear
+        // X-frame motor mixer
         int base = constrain(sp_throttle, 0, 800) + ESC_PULSE_MIN;
         m1 = (uint16_t)constrain(base + out_roll - out_pitch + out_yaw, ESC_PULSE_MIN, ESC_PULSE_MAX);
         m2 = (uint16_t)constrain(base - out_roll - out_pitch - out_yaw, ESC_PULSE_MIN, ESC_PULSE_MAX);
@@ -786,13 +1095,23 @@ void loop() {
     }
     writeMotors();
 
-    // ── 6. Telemetry every 200 ms ────────────────────────────
-    if (millis() - last_telem_ms >= 200) {
+    // ── 7. Blackbox — record at ~25 Hz, flush every 2 s ─────
+    if (armed && millis() - bb_last_rec_ms >= 40) {
+        bb_last_rec_ms = millis();
+        bbRecord((uint16_t)active_wp);
+    }
+    if (bb_active && millis() - bb_last_flush_ms >= BB_FLUSH_MS) {
+        bb_last_flush_ms = millis();
+        bbFlush();
+    }
+
+    // ── 8. Telemetry — TDMA slot (every TELEM_PERIOD_MS, offset by drone_id) ──
+    if (millis() - last_telem_ms >= TELEM_PERIOD_MS) {
         last_telem_ms = millis();
         sendTelemetry(active_wp);
     }
 
-    // ── 7. LEDs every 50 ms ──────────────────────────────────
+    // ── 9. LEDs every 50 ms ──────────────────────────────────
     if (millis() - last_led_ms >= 50) {
         last_led_ms = millis();
         ledsUpdate();

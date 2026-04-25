@@ -1,25 +1,17 @@
 export const interpolate = (kf1, kf2, t, mode = 'smooth') => {
-  if (mode === 'linear') {
-    return {
-      x: kf1.x + (kf2.x - kf1.x) * t,
-      y: kf1.y + (kf2.y - kf1.y) * t,
-      z: kf1.z + (kf2.z - kf1.z) * t,
-      yaw: kf1.yaw + (kf2.yaw - kf1.yaw) * t,
-      pitch: kf1.pitch + (kf2.pitch - kf1.pitch) * t,
-      roll: kf1.roll + (kf2.roll - kf1.roll) * t,
-    };
-  } else if (mode === 'smooth') {
-    const smoothT = t * t * (3 - 2 * t);
-    return {
-      x: kf1.x + (kf2.x - kf1.x) * smoothT,
-      y: kf1.y + (kf2.y - kf1.y) * smoothT,
-      z: kf1.z + (kf2.z - kf1.z) * smoothT,
-      yaw: kf1.yaw + (kf2.yaw - kf1.yaw) * smoothT,
-      pitch: kf1.pitch + (kf2.pitch - kf1.pitch) * smoothT,
-      roll: kf1.roll + (kf2.roll - kf1.roll) * smoothT,
-    };
-  }
-  return kf1;
+  const s = mode === 'smooth' ? t * t * (3 - 2 * t) : t;
+  const lerp = (a, b) => a + (b - a) * s;
+  return {
+    x: lerp(kf1.x, kf2.x),
+    y: lerp(kf1.y, kf2.y),
+    z: lerp(kf1.z, kf2.z),
+    r: lerp(kf1.r ?? 255, kf2.r ?? 255),
+    g: lerp(kf1.g ?? 255, kf2.g ?? 255),
+    b: lerp(kf1.b ?? 255, kf2.b ?? 255),
+    // color fn/fp taken from upcoming keyframe (no interpolation)
+    colorFn: kf2.colorFn ?? 0,
+    colorFp: kf2.colorFp ?? 0,
+  };
 };
 
 export const createFormationPositions = (formationType, droneCount, radius = 5) => {
