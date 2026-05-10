@@ -1,11 +1,14 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import './index.css';
-import App from './App';
+import { LanguageProvider } from './i18n';
+import MultiDroneControl from './components/MultiDroneControl';
 
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(
   <React.StrictMode>
-    <App />
+    <LanguageProvider>
+      <MultiDroneControl />
+    </LanguageProvider>
   </React.StrictMode>
 );
