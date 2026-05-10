@@ -20,8 +20,6 @@ import { saveMission, loadMission, load3DModel } from '../utils/fileOperations';
 import { assignVerticesToDrones } from '../utils/modelUtils';
 import droneConnection from '../utils/droneConnection';
 
-const MAX_LORA_LINES = 200;
-
 const MultiDroneControl = () => {
   const { lang, setLang, t } = useLanguage();
   const [drones, setDrones] = useState([]);
@@ -43,13 +41,11 @@ const MultiDroneControl = () => {
     geofenceRadius: 200,
   });
 
-  // COM Ports / LoRa Terminal / Funke state
   const [loraTermLines, setLoraTermLines] = useState([]);
   const [loraTermConnected, setLoraTermConnected] = useState(false);
   const [availablePorts, setAvailablePorts] = useState([]);
   const [selectedFunkeDroneId, setSelectedFunkeDroneId] = useState(null);
 
-  // 3D Model state
   const [loadedModel, setLoadedModel] = useState(null);
   const [modelVertices, setModelVertices] = useState([]);
   const [selectedVertices, setSelectedVertices] = useState([]);
@@ -137,9 +133,7 @@ const MultiDroneControl = () => {
 
     droneConnection.connect(handleTelemetry, handleStatus, handleDroneList, {
       onLoraTerminalLine: (raw) => {
-        setLoraTermLines(prev => prev.length >= MAX_LORA_LINES
-          ? [...prev.slice(1), raw]
-          : [...prev, raw]);
+        setLoraTermLines(prev => [...prev.slice(-199), raw]);
       },
       onPortStatusChange: (role, connected) => {
         if (role === 'lora_terminal') {
@@ -228,7 +222,6 @@ const MultiDroneControl = () => {
     addLog('Keyframe hinzugefügt für ' + (drones.find(d => d.id === droneId)?.name) + ' @ ' + maxTime + 's');
   };
 
-  // Auto-start: create t=0 keyframe for all drones at ground level
   const setStartKeyframes = () => {
     const existing0 = keyframes.filter(kf => kf.time === 0).map(kf => kf.droneId);
     const newKfs = drones
@@ -324,6 +317,7 @@ const MultiDroneControl = () => {
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const updateDroneModels = (time) => {
+    const updates = {};
     droneModelsRef.current.forEach((model, index) => {
       const drone = drones[index];
       if (!drone) return;
@@ -342,7 +336,6 @@ const MultiDroneControl = () => {
         THREE.MathUtils.degToRad(pos.yaw),
         THREE.MathUtils.degToRad(pos.roll)
       );
-      // Update LED color (RGB)
       if (model.material) {
         model.material.color.setRGB(
           (pos.r ?? 255) / 255,
@@ -350,11 +343,13 @@ const MultiDroneControl = () => {
           (pos.b ?? 255) / 255
         );
       }
-      setDrones(prev => prev.map(d => d.id === drone.id ? { ...d, x: pos.x, y: pos.y, z: pos.z, yaw: pos.yaw } : d));
+      updates[drone.id] = { x: pos.x, y: pos.y, z: pos.z, yaw: pos.yaw };
     });
+    if (Object.keys(updates).length > 0) {
+      setDrones(prev => prev.map(d => d.id in updates ? { ...d, ...updates[d.id] } : d));
+    }
   };
 
-  // Called when drone is moved via 3D gizmo
   const handleDroneMoved = (droneId, x, y, z) => {
     const existing = keyframes.find(kf => kf.droneId === droneId && Math.abs(kf.time - playbackTime) < 0.26);
     if (existing) {
@@ -369,7 +364,6 @@ const MultiDroneControl = () => {
     }
   };
 
-  // Called when 3D model is moved via gizmo
   const handleModelTransform = (pos, scale) => {
     setModelPosition(pos);
     if (scale !== undefined) setModelScale(scale);
@@ -501,7 +495,6 @@ const MultiDroneControl = () => {
           </button>
         </div>
 
-        {/* COM Ports Tab */}
         {activeTab === 'com' && (
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
             <LoraTerminal
@@ -523,7 +516,6 @@ const MultiDroneControl = () => {
           </div>
         )}
 
-        {/* GPS Tab */}
         {activeTab === 'gps' && (
           <div className="mb-4">
             <GPSMissionPlanner
@@ -535,13 +527,8 @@ const MultiDroneControl = () => {
           </div>
         )}
 
-        {/* 3D Tab */}
         {activeTab === '3d' && <div className="grid grid-cols-1 lg:grid-cols-4 gap-4 mb-4">
-
-          {/* Left: 3D Viewport + Timeline + HeightProfile */}
           <div className="lg:col-span-3 space-y-4">
-
-            {/* 3D Viewport */}
             <div className="bg-gray-800 rounded-lg p-4">
               <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
                 <h2 className="text-lg font-semibold">3D Viewport</h2>
@@ -607,7 +594,6 @@ const MultiDroneControl = () => {
               </div>
             </div>
 
-            {/* Timeline */}
             <Timeline
               keyframes={keyframes}
               drones={drones}
@@ -621,7 +607,6 @@ const MultiDroneControl = () => {
               setMaxTimeSetting={setMaxTimeSetting}
             />
 
-            {/* Height profile */}
             {keyframes.length > 0 && (
               <HeightProfile
                 keyframes={keyframes}
@@ -634,7 +619,6 @@ const MultiDroneControl = () => {
 
           </div>
 
-          {/* Right sidebar */}
           <div className="space-y-4">
             <DronePanel
               drones={drones}

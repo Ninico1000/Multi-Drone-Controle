@@ -43,7 +43,7 @@ const LoraTerminal = ({
         baudRate={baudRate}
         onPathChange={setSelectedPath}
         onBaudChange={setBaudRate}
-        onConnect={(path, baud) => onConnect && onConnect(path, baud)}
+        onConnect={onConnect}
         onDisconnect={onDisconnect}
         onRefresh={onRefresh}
       />

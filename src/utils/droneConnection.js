@@ -1,8 +1,3 @@
-/**
- * Drone Connection Manager
- * Handles WebSocket connection to Serial/UDP bridge server
- */
-
 const BRIDGE_URL = 'ws://localhost:3001';
 const REST_BASE  = 'http://localhost:3001';
 
@@ -17,20 +12,11 @@ class DroneConnection {
     this.onTelemetryCallback = null;
     this.onStatusCallback = null;
     this.onDroneListCallback = null;
-    // New optional callbacks
     this.onLoraTerminalLine = null;
     this.onPortStatusChange = null;
     this._seq = 0;
   }
 
-  /**
-   * @param {Function} onTelemetry  (droneIP, data, droneIdHint?) => void
-   * @param {Function} onStatus     (statusObj) => void
-   * @param {Function} onDroneList  (drones[]) => void
-   * @param {Object}   [opts]
-   * @param {Function} [opts.onLoraTerminalLine]  (rawLine, ts) => void
-   * @param {Function} [opts.onPortStatusChange]  (role, connected, path) => void
-   */
   connect(onTelemetry, onStatus, onDroneList, opts = {}) {
     this.onTelemetryCallback = onTelemetry;
     this.onStatusCallback = onStatus;
@@ -83,7 +69,6 @@ class DroneConnection {
             this.apConnected = message.apConnected || message.type === 'ap_connected';
             if (this.onStatusCallback) this.onStatusCallback(message);
 
-          // ── LoRa Terminal ────────────────────────────────────────────────
           } else if (message.type === 'lora_terminal_rx') {
             if (this.onLoraTerminalLine) this.onLoraTerminalLine(message.raw, message.ts);
 
@@ -175,12 +160,10 @@ class DroneConnection {
     return this.send(null, null, { cmd: 'timesync' });
   }
 
-  // ── Funke: forward RC channels to a specific drone ────────────────────────
   sendFunkeToDrone(droneId, channels) {
     return this.send(null, null, { command: 'funke_to_drone', droneId, channels });
   }
 
-  // ── REST helpers for port management ─────────────────────────────────────
   async listPorts() {
     const res = await fetch(`${REST_BASE}/api/ports`);
     if (!res.ok) throw new Error('Failed to list ports');
@@ -188,32 +171,26 @@ class DroneConnection {
   }
 
   async connectPort(role, path, baudRate = 115200) {
-    const res = await fetch(`${REST_BASE}/api/ports/connect`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ role, path, baudRate }),
-    });
-    if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.error || 'Failed to connect port');
-    }
-    return res.json();
+    return this._postJson('/api/ports/connect', { role, path, baudRate });
   }
 
   async disconnectPort(role) {
-    const res = await fetch(`${REST_BASE}/api/ports/disconnect`, {
+    return this._postJson('/api/ports/disconnect', { role });
+  }
+
+  async _postJson(endpoint, body) {
+    const res = await fetch(`${REST_BASE}${endpoint}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ role }),
+      body: JSON.stringify(body),
     });
     if (!res.ok) {
       const err = await res.json();
-      throw new Error(err.error || 'Failed to disconnect port');
+      throw new Error(err.error || 'Request failed');
     }
     return res.json();
   }
 
-  // ── Generic send ──────────────────────────────────────────────────────────
   send(droneIP, payload, directCommand = null) {
     if (!this.isConnected || !this.ws) {
       return Promise.reject(new Error('Not connected to bridge server'));
