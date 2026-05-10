@@ -43,44 +43,6 @@ export const loadMission = (setKeyframes, setInterpolationMode, addLog) => {
 };
 
 /**
- * Load a figure JSON file containing waypoints for a drone
- * Expected format:
- * {
- *   "name": "Figure Name",
- *   "description": "optional",
- *   "waypoints": [
- *     { "time": 0, "x": 0, "y": 0, "z": 1, "yaw": 0, "pitch": 0, "roll": 0 },
- *     ...
- *   ]
- * }
- */
-export const loadFigureJSON = (onLoad, addLog) => {
-  const input = document.createElement('input');
-  input.type = 'file';
-  input.accept = '.json';
-  input.onchange = (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      try {
-        const data = JSON.parse(event.target.result);
-        if (!data.waypoints || !Array.isArray(data.waypoints)) {
-          addLog('Fehler: JSON hat kein "waypoints" Array');
-          return;
-        }
-        addLog('Figur geladen: "' + (data.name || file.name) + '" mit ' + data.waypoints.length + ' Wegpunkten');
-        onLoad(data, file.name);
-      } catch (err) {
-        addLog('Fehler beim Laden der Figur-JSON');
-      }
-    };
-    reader.readAsText(file);
-  };
-  input.click();
-};
-
-/**
  * Load a 3D model file (OBJ, STL, GLTF, GLB)
  */
 export const load3DModel = (onLoad, onProgress, onError, addLog) => {

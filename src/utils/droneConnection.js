@@ -156,10 +156,6 @@ class DroneConnection {
     return this.send(null, null, { cmd: 'timesync' });
   }
 
-  startMissionAt(droneIP, droneId, groundMs) {
-    return this.send(droneIP, { to: droneId, cmd: 'start', at: groundMs, seq: ++this._seq });
-  }
-
   /**
    * Send command to drone via bridge
    */

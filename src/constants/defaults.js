@@ -46,10 +46,6 @@ export const SCENE_CONFIG = {
   cameraPosition: { x: 20, y: 20, z: 20 },
 };
 
-export const DRONE_MODEL_CONFIG = {
-  geometry: { radiusTop: 0.3, radiusBottom: 0.8, height: 4 },
-};
-
 export const DRONE_COLORS = [
   0xff0000, 0x00ff00, 0x0000ff, 0xffff00,
   0xff00ff, 0x00ffff, 0xff8800, 0x8800ff,

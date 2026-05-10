@@ -29,11 +29,6 @@ export const createFormationPositions = (formationType, droneCount, radius = 5) 
       x = index * 3 - droneCount * 1.5;
       y = 0;
       z = 3;
-    } else if (formationType === 'triangle') {
-      const angle = (index / droneCount) * Math.PI * 2;
-      x = Math.cos(angle) * radius;
-      y = Math.sin(angle) * radius;
-      z = index * 0.5 + 3;
     }
 
     positions.push({ x, y, z });
