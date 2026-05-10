@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { Upload, Download, Play, Square, AlertCircle, Box, MapPin, Map, RefreshCw } from 'lucide-react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Upload, Download, Play, Square, AlertCircle, Box, MapPin, Map, RefreshCw, Terminal } from 'lucide-react';
 import { useLanguage } from '../i18n';
 import * as THREE from 'three';
 import ThreeScene from './ThreeScene';
@@ -12,11 +12,15 @@ import ModelControls from './ModelControls';
 import MissionExport from './MissionExport';
 import HeightProfile from './HeightProfile';
 import BlackboxViewer from './BlackboxViewer';
+import LoraTerminal from './LoraTerminal';
+import FunkeControl from './FunkeControl';
 import { INITIAL_DRONES, DRONE_COLORS } from '../constants/defaults';
 import { interpolate, createFormationPositions } from '../utils/interpolation';
 import { saveMission, loadMission, load3DModel } from '../utils/fileOperations';
 import { assignVerticesToDrones } from '../utils/modelUtils';
 import droneConnection from '../utils/droneConnection';
+
+const MAX_LORA_LINES = 200;
 
 const MultiDroneControl = () => {
   const { lang, setLang, t } = useLanguage();
@@ -38,6 +42,12 @@ const MultiDroneControl = () => {
     geofenceCenter: null,
     geofenceRadius: 200,
   });
+
+  // COM Ports / LoRa Terminal / Funke state
+  const [loraTermLines, setLoraTermLines] = useState([]);
+  const [loraTermConnected, setLoraTermConnected] = useState(false);
+  const [availablePorts, setAvailablePorts] = useState([]);
+  const [selectedFunkeDroneId, setSelectedFunkeDroneId] = useState(null);
 
   // 3D Model state
   const [loadedModel, setLoadedModel] = useState(null);
@@ -125,7 +135,19 @@ const MultiDroneControl = () => {
       }
     };
 
-    droneConnection.connect(handleTelemetry, handleStatus, handleDroneList);
+    droneConnection.connect(handleTelemetry, handleStatus, handleDroneList, {
+      onLoraTerminalLine: (raw) => {
+        setLoraTermLines(prev => prev.length >= MAX_LORA_LINES
+          ? [...prev.slice(1), raw]
+          : [...prev, raw]);
+      },
+      onPortStatusChange: (role, connected) => {
+        if (role === 'lora_terminal') {
+          setLoraTermConnected(connected);
+          addLog('LoRa Terminal ' + (connected ? 'verbunden' : 'getrennt'));
+        }
+      },
+    });
     return () => droneConnection.disconnect();
   }, []);
 
@@ -281,6 +303,25 @@ const MultiDroneControl = () => {
     droneConnection.sendTimesync();
     addLog('Zeitsynchronisation gesendet');
   };
+
+  const refreshPorts = useCallback(async () => {
+    try {
+      const list = await droneConnection.listPorts();
+      setAvailablePorts(list);
+    } catch { /* bridge not yet reachable */ }
+  }, []);
+
+  const handleLoraTerminalConnect = useCallback(async (path, baudRate) => {
+    try {
+      await droneConnection.connectPort('lora_terminal', path, baudRate);
+    } catch (err) { addLog('LoRa Terminal Fehler: ' + err.message); }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleLoraTerminalDisconnect = useCallback(async () => {
+    try {
+      await droneConnection.disconnectPort('lora_terminal');
+    } catch (err) { addLog('LoRa Terminal Fehler: ' + err.message); }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const updateDroneModels = (time) => {
     droneModelsRef.current.forEach((model, index) => {
@@ -452,7 +493,35 @@ const MultiDroneControl = () => {
           >
             <Map className="w-4 h-4" /> {t('tabGps')}
           </button>
+          <button
+            onClick={() => { setActiveTab('com'); refreshPorts(); }}
+            className={`px-4 py-2 rounded-t text-sm font-medium flex items-center gap-2 transition-colors ${activeTab === 'com' ? 'bg-gray-800 text-white border-b-2 border-purple-500' : 'text-gray-400 hover:text-white'}`}
+          >
+            <Terminal className="w-4 h-4" /> {t('tabCom')}
+          </button>
         </div>
+
+        {/* COM Ports Tab */}
+        {activeTab === 'com' && (
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
+            <LoraTerminal
+              lines={loraTermLines}
+              connected={loraTermConnected}
+              availablePorts={availablePorts}
+              onConnect={handleLoraTerminalConnect}
+              onDisconnect={handleLoraTerminalDisconnect}
+              onRefresh={refreshPorts}
+              onClear={() => setLoraTermLines([])}
+            />
+            <FunkeControl
+              drones={drones}
+              selectedDroneId={selectedFunkeDroneId}
+              onSelectDrone={setSelectedFunkeDroneId}
+              bridgeConnected={bridgeConnected}
+              addLog={addLog}
+            />
+          </div>
+        )}
 
         {/* GPS Tab */}
         {activeTab === 'gps' && (

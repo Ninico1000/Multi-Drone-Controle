@@ -3,6 +3,9 @@
  * Handles WebSocket connection to Serial/UDP bridge server
  */
 
+const BRIDGE_URL = 'ws://localhost:3001';
+const REST_BASE  = 'http://localhost:3001';
+
 class DroneConnection {
   constructor() {
     this.ws = null;
@@ -14,16 +17,29 @@ class DroneConnection {
     this.onTelemetryCallback = null;
     this.onStatusCallback = null;
     this.onDroneListCallback = null;
+    // New optional callbacks
+    this.onLoraTerminalLine = null;
+    this.onPortStatusChange = null;
     this._seq = 0;
   }
 
-  connect(onTelemetry, onStatus, onDroneList) {
+  /**
+   * @param {Function} onTelemetry  (droneIP, data, droneIdHint?) => void
+   * @param {Function} onStatus     (statusObj) => void
+   * @param {Function} onDroneList  (drones[]) => void
+   * @param {Object}   [opts]
+   * @param {Function} [opts.onLoraTerminalLine]  (rawLine, ts) => void
+   * @param {Function} [opts.onPortStatusChange]  (role, connected, path) => void
+   */
+  connect(onTelemetry, onStatus, onDroneList, opts = {}) {
     this.onTelemetryCallback = onTelemetry;
     this.onStatusCallback = onStatus;
     this.onDroneListCallback = onDroneList;
+    this.onLoraTerminalLine = opts.onLoraTerminalLine || null;
+    this.onPortStatusChange = opts.onPortStatusChange || null;
 
     try {
-      this.ws = new WebSocket('ws://localhost:3001');
+      this.ws = new WebSocket(BRIDGE_URL);
 
       this.ws.onopen = () => {
         console.log('Connected to bridge server');
@@ -37,28 +53,46 @@ class DroneConnection {
       this.ws.onmessage = (event) => {
         try {
           const message = JSON.parse(event.data);
-          console.log('Received:', message);
 
           if (message.type === 'telemetry' && this.onTelemetryCallback) {
             this.onTelemetryCallback(message.droneIP, message.data);
+
           } else if (message.type === 'lora_rx' && this.onTelemetryCallback) {
             const data = message.data;
             if (data && data.id != null) {
               this.onTelemetryCallback(null, data, data.id);
             }
+
           } else if (message.type === 'preflight' && this.onStatusCallback) {
             this.onStatusCallback({ type: 'preflight', ...message });
+
           } else if (message.type === 'drone_list' && this.onDroneListCallback) {
             this.onDroneListCallback(message.drones);
+
           } else if (message.type === 'drone_connected' && this.onDroneListCallback) {
             this.discoverDrones();
+
           } else if (message.type === 'drone_disconnected' && this.onDroneListCallback) {
             this.discoverDrones();
-          } else if (message.type === 'connected' || message.type === 'ap_connected' || message.type === 'ap_disconnected') {
+
+          } else if (
+            message.type === 'connected' ||
+            message.type === 'ap_connected' ||
+            message.type === 'ap_disconnected'
+          ) {
             this.apConnected = message.apConnected || message.type === 'ap_connected';
-            if (this.onStatusCallback) {
-              this.onStatusCallback(message);
-            }
+            if (this.onStatusCallback) this.onStatusCallback(message);
+
+          // ── LoRa Terminal ────────────────────────────────────────────────
+          } else if (message.type === 'lora_terminal_rx') {
+            if (this.onLoraTerminalLine) this.onLoraTerminalLine(message.raw, message.ts);
+
+          } else if (message.type === 'lora_terminal_connected') {
+            if (this.onPortStatusChange) this.onPortStatusChange('lora_terminal', true, message.path);
+
+          } else if (message.type === 'lora_terminal_disconnected') {
+            if (this.onPortStatusChange) this.onPortStatusChange('lora_terminal', false, message.path);
+
           } else if (this.onStatusCallback) {
             this.onStatusCallback(message);
           }
@@ -73,11 +107,13 @@ class DroneConnection {
         if (this.onStatusCallback) {
           this.onStatusCallback({ connected: false, message: 'Bridge disconnected' });
         }
-
         if (this.reconnectAttempts < this.maxReconnectAttempts) {
           this.reconnectAttempts++;
-          console.log(`Reconnecting... (${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
-          setTimeout(() => this.connect(onTelemetry, onStatus, onDroneList), this.reconnectDelay);
+          console.log(`Reconnecting… (${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+          setTimeout(
+            () => this.connect(onTelemetry, onStatus, onDroneList, opts),
+            this.reconnectDelay
+          );
         }
       };
 
@@ -106,34 +142,17 @@ class DroneConnection {
 
   discoverDrones() {
     if (!this.isConnected || !this.ws) {
-      console.error('Not connected to bridge server');
       return Promise.reject(new Error('Not connected to bridge server'));
     }
     return this.send(null, null, { command: 'discover' });
   }
 
-  /**
-   * Send mission keyframes to drone
-   */
   sendMission(droneIP, keyframes) {
     if (!this.isConnected || !this.ws) {
       return Promise.reject(new Error('Not connected to bridge server'));
     }
-
-    const missionData = keyframes.map(kf => ({
-      t: kf.time,
-      x: kf.x,
-      y: kf.y,
-      z: kf.z,
-    }));
-
-    const payload = {
-      cmd: 'mission',
-      seq: ++this._seq,
-      data: missionData,
-    };
-
-    return this.send(droneIP, payload);
+    const missionData = keyframes.map(kf => ({ t: kf.time, x: kf.x, y: kf.y, z: kf.z }));
+    return this.send(droneIP, { cmd: 'mission', seq: ++this._seq, data: missionData });
   }
 
   startMission(droneIP) {
@@ -156,20 +175,51 @@ class DroneConnection {
     return this.send(null, null, { cmd: 'timesync' });
   }
 
-  /**
-   * Send command to drone via bridge
-   */
+  // ── Funke: forward RC channels to a specific drone ────────────────────────
+  sendFunkeToDrone(droneId, channels) {
+    return this.send(null, null, { command: 'funke_to_drone', droneId, channels });
+  }
+
+  // ── REST helpers for port management ─────────────────────────────────────
+  async listPorts() {
+    const res = await fetch(`${REST_BASE}/api/ports`);
+    if (!res.ok) throw new Error('Failed to list ports');
+    return res.json();
+  }
+
+  async connectPort(role, path, baudRate = 115200) {
+    const res = await fetch(`${REST_BASE}/api/ports/connect`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ role, path, baudRate }),
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.error || 'Failed to connect port');
+    }
+    return res.json();
+  }
+
+  async disconnectPort(role) {
+    const res = await fetch(`${REST_BASE}/api/ports/disconnect`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ role }),
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.error || 'Failed to disconnect port');
+    }
+    return res.json();
+  }
+
+  // ── Generic send ──────────────────────────────────────────────────────────
   send(droneIP, payload, directCommand = null) {
     if (!this.isConnected || !this.ws) {
       return Promise.reject(new Error('Not connected to bridge server'));
     }
-
     return new Promise((resolve, reject) => {
-      const message = directCommand || {
-        droneIP,
-        payload,
-      };
-
+      const message = directCommand || { droneIP, payload };
       try {
         this.ws.send(JSON.stringify(message));
         resolve();
