@@ -100,6 +100,22 @@ const translations = {
 
     // GPSMissionPlanner
     gpsPlanner: 'GPS Missionsplaner',
+
+    // COM Ports / LoRa Terminal / Funke
+    tabCom: 'COM & Funke',
+    loraTerminal: 'LoRa Terminal',
+    funkeControl: 'Funke / RC Controller',
+    portConnect: 'Verbinden',
+    portDisconnect: 'Trennen',
+    portRefresh: 'Aktualisieren',
+    noGamepad: 'Kein Gamepad erkannt',
+    gamepadDetected: 'Gamepad erkannt',
+    autoForward: 'Auto-Weiterleiten',
+    targetDrone: 'Ziel-Drohne',
+    clearTerminal: 'Terminal löschen',
+    autoScroll: 'Auto-Scroll',
+    rcChannels: 'RC Kanäle',
+    noDroneSelected: '-- Keine Drohne --',
   },
 
   en: {
@@ -200,6 +216,22 @@ const translations = {
 
     // GPSMissionPlanner
     gpsPlanner: 'GPS Mission Planner',
+
+    // COM Ports / LoRa Terminal / Funke
+    tabCom: 'COM & RC',
+    loraTerminal: 'LoRa Terminal',
+    funkeControl: 'RC Controller',
+    portConnect: 'Connect',
+    portDisconnect: 'Disconnect',
+    portRefresh: 'Refresh',
+    noGamepad: 'No gamepad detected',
+    gamepadDetected: 'Gamepad detected',
+    autoForward: 'Auto-forward',
+    targetDrone: 'Target drone',
+    clearTerminal: 'Clear terminal',
+    autoScroll: 'Auto-scroll',
+    rcChannels: 'RC Channels',
+    noDroneSelected: '-- No drone --',
   },
 };
 
