@@ -6,3 +6,6 @@ logs/
 .__smb*
 .history/
 Oringinal/ESP-Drone/
+dist/
+install-log.txt
+npm-install-*.log

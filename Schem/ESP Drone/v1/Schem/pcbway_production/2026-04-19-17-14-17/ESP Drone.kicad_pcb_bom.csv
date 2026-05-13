@@ -1,0 +1,36 @@
+﻿Designator,Quantity,Value,Footprint,Package,MPN,DNP,Mount_Type,Description
+C1,1,10 µF,C_1206_3216Metric,,,,smt,Polarized capacitor
+C10,1,10nF,C_0603_1608Metric,,,,smt,Unpolarized capacitor
+"C11, C21, C22, C38",4,4.7µF,C_1206_3216Metric,,,,smt,Unpolarized capacitor
+"C13, C42",2,1µF,C_1206_3216Metric,,,,smt,Unpolarized capacitor
+"C14, C2, C23, C24, C25, C26, C27, C28, C29, C30, C31, C32, C33, C34, C35, C36, C37, C39, C40, C41",20,100nF,C_0603_1608Metric,,,,smt,Unpolarized capacitor
+"C15, C16",2,12pF,C_0603_1608Metric,,,,smt,Unpolarized capacitor
+C17,1,2.2pF,C_0603_1608Metric,,,,smt,Unpolarized capacitor
+C18,1,4.7pF,C_0603_1608Metric,,,,smt,Unpolarized capacitor
+C19,1,1pF,C_0603_1608Metric,,,,smt,Unpolarized capacitor
+C20,1,15pF,C_0603_1608Metric,,,,smt,Unpolarized capacitor
+C3,1,0.1uF,C_0603_1608Metric,,,,smt,Polarized capacitor
+"C4, C5",2,22 uF,C_1206_3216Metric,,,,smt,Polarized capacitor
+C6,1,10µF,C_1206_3216Metric,,,,smt,Unpolarized capacitor
+C7,1,22µF,C_1206_3216Metric,,,,smt,Unpolarized capacitor
+C8,1,0.1 uF,C_0603_1608Metric,,,,smt,Unpolarized capacitor
+C9,1,10 uF,C_1206_3216Metric,,,,smt,Unpolarized capacitor
+"D1, D10, D11, D12, D13, D14, D15, D16, D2, D3, D4, D5, D6, D7, D8, D9",16,WS2812B,LED_WS2812B_PLCC4_5.0x5.0mm_P3.2mm,,,,smt,RGB LED with integrated controller
+J1,1,Micro_SD_Card,microSD_HC_Molex_104031-0811,,,,smt,Micro SD Card Socket
+J2,1,GEPRC M10 FPV,JST_EH_B6B-EH-A_1x06_P2.50mm_Vertical,,,,tht,"Generic connectable mounting pin connector, single row, 01x06, script generated (kicad-library-utils/schlib/autogen/connector/)"
+"J3, J4, J5, J6",4,Conn_01x03_Pin,JST_EH_B3B-EH-A_1x03_P2.50mm_Vertical,,,,tht,"Generic connector, single row, 01x03, script generated"
+J7,1,Conn_Coaxial,U.FL_Hirose_U.FL-R-SMT-1_Vertical,,,,smt,"coaxial connector (BNC, SMA, SMB, SMC, Cinch/RCA, LEMO, ...)"
+L1,1,2.2uH,L_1210_3225Metric,,,,smt,Inductor
+L2,1,5.6nH,L_0805_2012Metric,,,,smt,Inductor
+R1,1,100kΩ,R_0201_0603Metric,,,,smt,Resistor
+R2,1,55.4 kΩ,R_0201_0603Metric,,,,smt,Resistor
+R3,1,10 kΩ,R_0201_0603Metric,,,,smt,Resistor
+R4,1,330 Ω,R_0201_0603Metric,,,,smt,Resistor
+"R5, R6",2,4.7 kΩ,R_0201_0603Metric,,,,smt,Resistor
+"R7, R8",2,10kΩ,R_0201_0603Metric,,,,smt,Resistor
+U1,1,ESP32-S2-WROVER,ESP32-DevKitC,,,,tht,"RF Module, ESP32-D0WDQ6 SoC, Wi-Fi 802.11b/g/n, 32-bit, 2.7-3.6V, onboard antenna, SMD"
+U2,1,TPS563200,SOT-23-6,,,,smt,"3A Synchronous Step-Down Voltage Regulator, Adjustable Output Voltage, 4.5-17V Input Voltage, SOT-23-6"
+U3,1,MPU-6050,InvenSense_QFN-24_4x4mm_P0.5mm,,,,smt,"InvenSense 6-Axis Motion Sensor, Gyroscope, Accelerometer, I2C"
+U4,1,AMS1117-3.3,SOT-223-3_TabPin2,,,,smt,"1A Low Dropout regulator, positive, 3.3V fixed output, SOT-223"
+U5,1,SX1262IMLTRT,QFN-24-1EP_4x4mm_P0.5mm_EP2.6x2.6mm,,,,smt,"150 MHz to 960 MHz Low Power Long Range Transceiver, 22dBm output power, spreading factor from 5 to 12, LoRA, QFN-24"
+Y1,1,32MHz,Crystal_HC49-U_Horizontal,,,,tht,Two pin crystal
