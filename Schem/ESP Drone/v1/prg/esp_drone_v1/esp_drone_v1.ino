@@ -92,7 +92,7 @@
 
 #define GPS_BAUD_DEFAULT    38400
 
-// BMP280 — I2C Bus 0 (shares bus with MPU-6050)
+// BMP280 — I2C Bus 0 (shared bus with MPU-6050)
 #define BMP280_I2C_ADDR     0x76    // SDO->GND = 0x76, SDO->VCC = 0x77
 
 #define LORA_FREQUENCY      868.0f
