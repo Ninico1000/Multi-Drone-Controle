@@ -1,8 +1,33 @@
+# Dependencies
 node_modules/
+
+# Build outputs
+build/
+dist/
+dist-electron/
+
+# Embedded reference repo (see https://github.com/Circuit-Digest/ESP-Drone)
+Oringinal/ESP-Drone/
+
+# Logs
 logs/
 *.log
+
+# Environment
 .env
-.claude/
-.__smb*
+.env.local
+.env.*.local
+
+# Claude Code (personal/local)
+.claude/CLAUDE.local.md
+.claude/settings.local.json
+
+# IDE / Editor local history
 .history/
-Oringinal/ESP-Drone/
+**/.history/
+.__smb*
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
